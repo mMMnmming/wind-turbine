@@ -64,8 +64,9 @@ def _directed_cost(coordinates: Tensor, route: Tensor, instance: WindATSPInstanc
 
 def _sample_batch(instance: WindATSPInstance, batch_size: int, device: torch.device) -> Tensor:
     base = torch.tensor(instance.coordinates_km, dtype=torch.float32, device=device)
-    noise = torch.randn(batch_size, *base.shape, device=device) * 0.03
-    return base.unsqueeze(0).expand(batch_size, -1, -1) + noise
+    # KDE-generated fields supply topology variation. Do not perturb a
+    # validated Stage-1 group into an infeasible routing instance.
+    return base.unsqueeze(0).expand(batch_size, -1, -1).clone()
 
 
 def train(
@@ -137,3 +138,4 @@ def train(
     (output / "config_snapshot.json").write_text(json.dumps(asdict(config), indent=2) + "\n", encoding="utf-8")
     (output / "training_history.json").write_text(json.dumps(history, indent=2) + "\n", encoding="utf-8")
     return output / "latest.pt"
+
