@@ -6,6 +6,37 @@ import torch
 from torch import Tensor, nn
 
 
+def _nearest_neighbor_completion_mask(
+    travel_time_seconds: Tensor,
+    visited: Tensor,
+    current: Tensor,
+    elapsed: Tensor,
+    hover_equivalent_seconds: float,
+    max_endurance_seconds: float,
+) -> Tensor:
+    """Keep only next actions with a feasible nearest-neighbour completion."""
+    batch_size, node_count, _ = travel_time_seconds.shape
+    device = travel_time_seconds.device
+    batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
+    candidates = torch.arange(node_count, device=device).unsqueeze(0).expand(batch_size, -1)
+    hypothetical_visited = visited.unsqueeze(1).expand(-1, node_count, -1).clone()
+    hypothetical_visited.scatter_(2, candidates.unsqueeze(-1), True)
+    cost = elapsed.unsqueeze(1) + travel_time_seconds[batch_indices, current.unsqueeze(1), candidates]
+    cost = cost + hover_equivalent_seconds
+    cursor = candidates
+    infinity = torch.finfo(travel_time_seconds.dtype).max
+    for _ in range(node_count - 2):
+        complete = hypothetical_visited.all(dim=-1)
+        outbound = travel_time_seconds[batch_indices, cursor, :].masked_fill(hypothetical_visited, infinity)
+        successor = torch.argmin(outbound, dim=-1)
+        step_time = outbound.gather(2, successor.unsqueeze(-1)).squeeze(-1)
+        cost = cost + torch.where(complete, torch.zeros_like(step_time), step_time + hover_equivalent_seconds)
+        cursor = torch.where(complete, cursor, successor)
+        hypothetical_visited.scatter_(2, cursor.unsqueeze(-1), True)
+    cost = cost + travel_time_seconds[batch_indices, cursor, 0]
+    return cost <= max_endurance_seconds
+
+
 class GraphPointerNetwork(nn.Module):
     """Autoregressive graph pointer policy adapted from attention-learn-to-route concepts."""
 
@@ -65,14 +96,13 @@ class GraphPointerNetwork(nn.Module):
             logits = (keys * self.query_projection(query).unsqueeze(1)).sum(dim=-1) * scale
             invalid = visited
             if travel_time_seconds is not None:
-                from_current = travel_time_seconds[
-                    torch.arange(batch_size, device=features.device), current, :
-                ]
-                return_to_depot = travel_time_seconds[:, :, 0]
-                safe = elapsed.unsqueeze(1) + from_current + hover_equivalent_seconds + return_to_depot <= max_endurance_seconds
-                invalid = visited | ~safe
+                completion_safe = _nearest_neighbor_completion_mask(
+                    travel_time_seconds, visited, current, elapsed,
+                    hover_equivalent_seconds, max_endurance_seconds,
+                )
+                invalid = visited | ~completion_safe
                 if torch.any(invalid.all(dim=1)):
-                    raise RuntimeError("No endurance-safe unvisited action is available during decoding.")
+                    raise RuntimeError("No completion-safe unvisited action is available during decoding.")
             logits = logits.masked_fill(invalid, float("-inf"))
             distribution = torch.distributions.Categorical(logits=logits)
             action = torch.argmax(logits, dim=-1) if decode_type == "greedy" else distribution.sample()
@@ -102,3 +132,4 @@ def make_node_features(coordinates: Tensor, wind_speed_mps: float, wind_directio
         device=coordinates.device,
     ).view(1, 1, 3).expand(batch_size, nodes, 3)
     return torch.cat((normalized, depot_flag, wind), dim=-1)
+
