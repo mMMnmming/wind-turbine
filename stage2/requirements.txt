@@ -1,0 +1,7 @@
+numpy>=1.26,<3
+scipy>=1.11,<2
+tqdm>=4.66,<5
+tensorboard_logger>=0.1.0
+matplotlib>=3.8,<4
+# PyTorch is CUDA-version-specific. Install it from requirements-cuda121.txt
+# or choose the matching command from https://pytorch.org/get-started/locally/.

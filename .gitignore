@@ -1,0 +1,22 @@
+# Python environments and interpreter caches
+.venv/
+__pycache__/
+**/__pycache__/
+.pytest_cache/
+*.py[cod]
+
+# Experiment products: regenerate or store outside Git / with Git LFS
+outputs/
+stage1/results/
+stage2/outputs/
+*.pt
+*.pth
+*.ckpt
+*.log
+events.out.tfevents.*
+
+# Local tooling
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
