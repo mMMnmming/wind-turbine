@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
 import random
+import time
 
 import numpy as np
 import torch
@@ -87,6 +88,9 @@ def train(
     baseline.eval()
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     history: list[dict[str, float]] = []
+    metrics_path = output / 'metrics.jsonl'
+    if resume_checkpoint is None:
+        metrics_path.write_text('', encoding='utf-8')
     start_epoch = 0
     if resume_checkpoint is not None:
         payload = torch.load(resume_checkpoint, map_location=device, weights_only=False)
@@ -96,9 +100,20 @@ def train(
         history = list(payload.get("history", []))
         start_epoch = int(payload["epoch"])
     best_cost = min((item["mean_equivalent_seconds"] for item in history), default=float("inf"))
+    print(
+        f"Training start | device={device} | regions={len(instances)} | "
+        f"epochs={config.epochs} | batches/epoch={config.batches_per_epoch} | batch={config.batch_size}",
+        flush=True,
+    )
     for epoch in range(start_epoch, config.epochs):
+        epoch_started = time.perf_counter()
         model.train()
         costs: list[float] = []
+        baseline_costs: list[float] = []
+        losses: list[float] = []
+        advantages: list[float] = []
+        gradient_norms: list[float] = []
+        feasible_rates: list[float] = []
         for step in range(config.batches_per_epoch):
             instance = instances[(epoch * config.batches_per_epoch + step) % len(instances)]
             coordinates = _sample_batch(instance, config.batch_size, device)
@@ -120,22 +135,52 @@ def train(
             loss = ((cost - baseline_cost) * log_probability).mean()
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_norm)
+            gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_norm)
             optimizer.step()
             costs.append(float(cost.mean().detach().cpu()))
+            baseline_costs.append(float(baseline_cost.mean().detach().cpu()))
+            losses.append(float(loss.detach().cpu()))
+            advantages.append(float((cost - baseline_cost).mean().detach().cpu()))
+            gradient_norms.append(float(gradient_norm.detach().cpu()))
+            feasible_rates.append(float((cost <= instance.config.max_endurance_seconds).float().mean().detach().cpu()))
         mean_cost = float(np.mean(costs))
-        history.append({"epoch": float(epoch + 1), "mean_equivalent_seconds": mean_cost})
-        if mean_cost <= best_cost:
+        improved = mean_cost <= best_cost
+        if improved:
             baseline.load_state_dict(model.state_dict())
             best_cost = mean_cost
+        epoch_metrics = {
+            "epoch": float(epoch + 1),
+            "mean_equivalent_seconds": mean_cost,
+            "mean_baseline_equivalent_seconds": float(np.mean(baseline_costs)),
+            "mean_advantage_seconds": float(np.mean(advantages)),
+            "reinforce_loss": float(np.mean(losses)),
+            "feasible_route_rate": float(np.mean(feasible_rates)),
+            "gradient_norm_before_clip": float(np.mean(gradient_norms)),
+            "learning_rate": float(optimizer.param_groups[0]["lr"]),
+            "epoch_seconds": time.perf_counter() - epoch_started,
+            "best_equivalent_seconds": best_cost,
+        }
+        history.append(epoch_metrics)
         payload = {
             "model": model.state_dict(), "baseline": baseline.state_dict(), "optimizer": optimizer.state_dict(),
             "epoch": epoch + 1, "training_config": asdict(config), "history": history,
         }
         torch.save(payload, output / "latest.pt")
-        if mean_cost <= best_cost:
+        if improved:
             torch.save(payload, output / "best.pt")
+        with metrics_path.open("a", encoding="utf-8") as metrics_file:
+            metrics_file.write(json.dumps(epoch_metrics) + "\n")
+        (output / "training_history.json").write_text(json.dumps(history, indent=2) + "\n", encoding="utf-8")
+        print(
+            f"Epoch {epoch + 1:03d}/{config.epochs} | cost={mean_cost:.2f}s | "
+            f"baseline={epoch_metrics['mean_baseline_equivalent_seconds']:.2f}s | "
+            f"advantage={epoch_metrics['mean_advantage_seconds']:.2f}s | "
+            f"loss={epoch_metrics['reinforce_loss']:.4f} | "
+            f"feasible={epoch_metrics['feasible_route_rate']:.1%} | "
+            f"grad={epoch_metrics['gradient_norm_before_clip']:.3f} | "
+            f"best={best_cost:.2f}s | {epoch_metrics['epoch_seconds']:.1f}s",
+            flush=True,
+        )
     (output / "config_snapshot.json").write_text(json.dumps(asdict(config), indent=2) + "\n", encoding="utf-8")
     (output / "training_history.json").write_text(json.dumps(history, indent=2) + "\n", encoding="utf-8")
     return output / "latest.pt"
-
