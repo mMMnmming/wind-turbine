@@ -48,3 +48,18 @@ and returning to the nest remains within the equivalent-energy budget. Each
 final route is then independently checked by `WindATSPInstance` before it is
 reported. The virtual farm KDE, network depth, seed, and training schedule are
 reproduction assumptions, not unpublished paper parameters.
+## Evaluation artifacts
+
+Evaluation writes a separate, non-overwriting result directory by default:
+`stage2/outputs/evaluations/<dataset>_<checkpoint>/`. It contains
+`evaluation.log`, CSV/JSON route audits, a grouped cost comparison, a four-region
+model-route overview, and one high-resolution route figure per region.
+
+```powershell
+python -m stage2.run evaluate --input turbine87.tsv --checkpoint stage2\outputs\best.pt
+python -m stage2.run evaluate --input turbine87.tsv --checkpoint stage2\outputs\best.pt --random-samples 1000 --plot-dpi 300
+```
+
+The comparison contains the model greedy route, a directed nearest-neighbour
+baseline, and fixed-seed random permutations. Infeasible baselines are retained
+and explicitly marked rather than silently repaired.
