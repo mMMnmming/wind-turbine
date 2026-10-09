@@ -28,7 +28,7 @@ class EvaluationTests(unittest.TestCase):
 
     def test_nearest_neighbor_is_deterministic_and_closed(self) -> None:
         route = nearest_neighbor_route(self.instance)
-        self.assertEqual(route, (0, 1, 3, 2, 0))
+        self.assertEqual(route, (0, 1, 2, 3, 0))
 
     def test_seeded_random_summary_is_stable(self) -> None:
         first = random_route_summary(self.instance, samples=25, seed=1234)

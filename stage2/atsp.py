@@ -16,6 +16,7 @@ class RouteValidationError(ValueError):
 class WindATSPConfig:
     wind_speed_mps: float = 6.0
     wind_direction_degrees: float = 90.0
+    gust_speed_mps: float = 12.0
     max_horizontal_speed_mps: float = 23.0
     max_endurance_seconds: float = 2460.0
     hover_seconds_per_turbine: float = 10.0
@@ -63,7 +64,9 @@ class WindATSPInstance:
         delta = self.coordinates_km[None, :, :] - self.coordinates_km[:, None, :]
         distance_m = np.linalg.norm(delta, axis=-1) * 1_000.0
         direction = np.arctan2(delta[..., 1], delta[..., 0])
-        wind_angle = math.radians(self.config.wind_direction_degrees)
+        # Paper convention is a compass bearing: 0° north, 90° east.
+        # Convert to Cartesian angle (0° +x/east, counter-clockwise positive).
+        wind_angle = math.radians(90.0 - self.config.wind_direction_degrees)
         ground_speed = self.config.max_horizontal_speed_mps + self.config.wind_speed_mps * np.cos(
             direction - wind_angle
         )

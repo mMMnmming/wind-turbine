@@ -13,7 +13,9 @@ from stage1.deployment import Turbine, load_config, load_turbines, run_deploymen
 from .atsp import WindATSPConfig, WindATSPInstance
 
 
-def build_deployment_instances(turbine_path: Path, deployment_config_path: Path) -> list[WindATSPInstance]:
+def build_deployment_instances(
+    turbine_path: Path, deployment_config_path: Path, gust_speed_mps: float = 12.0
+) -> list[WindATSPInstance]:
     """Recreate Stage-1 groups in memory and convert them to depot-led ATSP instances."""
     deployment_config = load_config(deployment_config_path)
     turbines = load_turbines(turbine_path)
@@ -22,6 +24,7 @@ def build_deployment_instances(turbine_path: Path, deployment_config_path: Path)
     routing_config = WindATSPConfig(
         wind_speed_mps=deployment_config.wind_speed_mps,
         wind_direction_degrees=deployment_config.wind_direction_degrees,
+        gust_speed_mps=gust_speed_mps,
         max_horizontal_speed_mps=deployment_config.max_horizontal_speed_mps,
         max_endurance_seconds=deployment_config.max_endurance_seconds,
         hover_seconds_per_turbine=deployment_config.hover_seconds_per_turbine,
@@ -53,6 +56,8 @@ def build_kde_instances(
     deployment_config_path: Path,
     field_count: int,
     seed: int,
+    field_offset: int = 0,
+    gust_speed_mps: float = 12.0,
 ) -> list[WindATSPInstance]:
     """Generate seeded virtual farms, rerun Stage 1, and return legal ATSP groups.
 
@@ -68,6 +73,7 @@ def build_kde_instances(
     routing_config = WindATSPConfig(
         wind_speed_mps=deployment_config.wind_speed_mps,
         wind_direction_degrees=deployment_config.wind_direction_degrees,
+        gust_speed_mps=gust_speed_mps,
         max_horizontal_speed_mps=deployment_config.max_horizontal_speed_mps,
         max_endurance_seconds=deployment_config.max_endurance_seconds,
         hover_seconds_per_turbine=deployment_config.hover_seconds_per_turbine,
@@ -76,7 +82,8 @@ def build_kde_instances(
     instances: list[WindATSPInstance] = []
     for field_index in range(field_count):
         coordinates = sample_kde_topology(source_points, len(source_turbines), seed + field_index)
-        turbines = [Turbine(f"virtual-{field_index:03d}-{index:03d}", float(x), float(y)) for index, (x, y) in enumerate(coordinates)]
+        field_id = field_index + field_offset
+        turbines = [Turbine(f"virtual-{field_id:05d}-{index:03d}", float(x), float(y)) for index, (x, y) in enumerate(coordinates)]
         deployment = run_deployment(turbines, deployment_config)
         by_identifier = {item.identifier: item for item in turbines}
         for nest in deployment.nests:
@@ -91,7 +98,36 @@ def build_kde_instances(
     return instances
 
 
-def load_region_instances(region_json_path: Path, deployment_config_path: Path) -> list[WindATSPInstance]:
+def build_training_validation_instances(
+    turbine_path: Path,
+    deployment_config_path: Path,
+    virtual_fields: int,
+    seed: int,
+    validation_fields: int = 16,
+    gust_speed_mps: float = 12.0,
+) -> tuple[list[WindATSPInstance], list[WindATSPInstance]]:
+    """Build 102-site deployment training regions and disjoint KDE validation fields."""
+    if virtual_fields < 1 or validation_fields < 1:
+        raise ValueError("Training and validation topology counts must both be positive.")
+    train = build_deployment_instances(turbine_path, deployment_config_path, gust_speed_mps)
+    train.extend(build_kde_instances(
+        turbine_path, deployment_config_path, virtual_fields, seed, field_offset=0,
+        gust_speed_mps=gust_speed_mps,
+    ))
+    validation = build_kde_instances(
+        turbine_path,
+        deployment_config_path,
+        validation_fields,
+        seed + 1_000_000,
+        field_offset=1_000_000,
+        gust_speed_mps=gust_speed_mps,
+    )
+    return train, validation
+
+
+def load_region_instances(
+    region_json_path: Path, deployment_config_path: Path, gust_speed_mps: float = 12.0
+) -> list[WindATSPInstance]:
     """Load externally supplied Stage-1 region JSON for evaluation.
 
     Accepted records are the auditable ``training_regions.json`` shape:
@@ -105,6 +141,7 @@ def load_region_instances(region_json_path: Path, deployment_config_path: Path) 
     routing_config = WindATSPConfig(
         wind_speed_mps=deployment_config.wind_speed_mps,
         wind_direction_degrees=deployment_config.wind_direction_degrees,
+        gust_speed_mps=gust_speed_mps,
         max_horizontal_speed_mps=deployment_config.max_horizontal_speed_mps,
         max_endurance_seconds=deployment_config.max_endurance_seconds,
         hover_seconds_per_turbine=deployment_config.hover_seconds_per_turbine,

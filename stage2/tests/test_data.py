@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from stage2.data import build_deployment_instances, sample_kde_topology
+from stage2.data import build_deployment_instances, build_training_validation_instances, sample_kde_topology
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -27,6 +27,27 @@ class DataPreparationTests(unittest.TestCase):
         second = sample_kde_topology(points, sample_size=6, seed=1234)
 
         np.testing.assert_allclose(first, second)
+
+    def test_training_and_validation_seed_streams_generate_different_topologies(self) -> None:
+        points = np.array([[0.0, 0.0], [1.0, 1.0], [2.0, 0.0], [1.0, 2.0]])
+
+        training = sample_kde_topology(points, sample_size=8, seed=1234)
+        validation = sample_kde_topology(points, sample_size=8, seed=1_001_234)
+
+        self.assertFalse(np.array_equal(training, validation))
+
+    def test_split_builder_keeps_real_102_regions_and_disjoint_virtual_ids(self) -> None:
+        training, validation = build_training_validation_instances(
+            ROOT / "turbine102.tsv", ROOT / "stage1" / "config.json",
+            virtual_fields=2, seed=321, validation_fields=2,
+        )
+
+        self.assertEqual(sum(not instance.identifiers[0].startswith("virtual-") for instance in training), 3)
+        train_virtual_ids = {identifier for instance in training for identifier in instance.identifiers if identifier.startswith("virtual-")}
+        validation_virtual_ids = {identifier for instance in validation for identifier in instance.identifiers if identifier.startswith("virtual-")}
+        self.assertTrue(train_virtual_ids)
+        self.assertTrue(validation_virtual_ids)
+        self.assertTrue(train_virtual_ids.isdisjoint(validation_virtual_ids))
 
 
 if __name__ == "__main__":

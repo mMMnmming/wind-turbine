@@ -1,16 +1,26 @@
-"""CLI for preparing data, training, resuming, and evaluating the Stage-2 policy."""
+"""CLI for reproducible Stage-2 preparation, training, search, and evaluation."""
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict, fields
 import hashlib
+import itertools
 import json
 from pathlib import Path
+import shutil
 
-from .data import build_deployment_instances, build_kde_instances, load_region_instances
+from .data import build_deployment_instances, build_training_validation_instances, load_region_instances
 
 
 ROOT = Path(__file__).resolve().parent
+
+
+def _resolve_input_path(mode: str, input_path: Path | None) -> Path:
+    if input_path is not None:
+        return input_path
+    default_filename = "turbine87.tsv" if mode == "evaluate" else "turbine102.tsv"
+    return ROOT.parent / default_filename
 
 
 def _instances_as_dict(instances: list[object]) -> list[dict[str, object]]:
@@ -20,15 +30,186 @@ def _instances_as_dict(instances: list[object]) -> list[dict[str, object]]:
             "coordinates_km": item.coordinates_km.tolist(),
             "depot_index": item.depot_index,
             "node_count": item.node_count,
+            "wind_speed_mps": item.config.wind_speed_mps,
+            "gust_speed_mps": item.config.gust_speed_mps,
+            "wind_direction_degrees": item.config.wind_direction_degrees,
         }
         for item in instances
     ]
 
 
+def _write_split_manifest(output: Path, name: str, instances: list[object]) -> None:
+    (output / f"{name}_regions.json").write_text(
+        json.dumps({"split": name, "regions": _instances_as_dict(instances)}, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_data_manifest(
+    output: Path,
+    input_path: Path,
+    stage1_config_path: Path,
+    seed: int,
+    virtual_fields: int,
+    validation_fields: int,
+    gust_speed_mps: float,
+) -> dict[str, str]:
+    input_hashes = {
+        "turbine_tsv_sha256": hashlib.sha256(input_path.read_bytes()).hexdigest(),
+        "stage1_config_sha256": hashlib.sha256(stage1_config_path.read_bytes()).hexdigest(),
+    }
+    manifest = {
+        "train_source": str(input_path),
+        "validation_source_distribution": str(input_path),
+        "seed": seed,
+        "training_kde_fields": virtual_fields,
+        "validation_kde_fields": validation_fields,
+        "validation_seed": seed + 1_000_000,
+        "gust_speed_mps": gust_speed_mps,
+        "input_hashes": input_hashes,
+        "note": "Validation KDE fields use a disjoint seed stream; test input is evaluated separately.",
+    }
+    (output / "data_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return input_hashes
+
+
+def _search_candidates() -> list[tuple[float, int, float]]:
+    return list(itertools.product((3e-5, 1e-4, 3e-4), (32, 64), (0.25, 0.5)))
+
+
+def _validation_from_checkpoint(checkpoint: Path) -> dict[str, float]:
+    import torch
+
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    return {key: float(value) for key, value in payload["best_validation"].items()}
+
+
+def _rank_key(validation: dict[str, float]) -> tuple[float, float]:
+    return validation["feasible_rate"], -validation["mean_normalized_flight_cost"]
+
+
+def _limit_virtual_fields(instances: list[object], field_count: int) -> list[object]:
+    """Keep all real regions plus virtual fields below a requested field count."""
+    selected = []
+    for instance in instances:
+        nest_id = instance.identifiers[instance.depot_index]
+        if not nest_id.startswith("virtual-"):
+            selected.append(instance)
+            continue
+        field_id = int(nest_id.split("-")[1])
+        if field_id < field_count:
+            selected.append(instance)
+    return selected
+
+
+def _run_search(
+    train_instances: list[object],
+    validation_instances: list[object],
+    base_config: object,
+    output: Path,
+) -> Path:
+    from dataclasses import replace
+
+    from .train import train
+
+    search_root = output / "search"
+    screening: list[dict[str, object]] = []
+    for trial, (learning_rate, virtual_fields, energy_weight) in enumerate(_search_candidates(), start=1):
+        trial_config = replace(base_config, learning_rate=learning_rate, energy_weight=energy_weight)
+        # Data counts are prepared by the caller for a common maximum. Each
+        # candidate filters on deterministic KDE field identifiers.
+        trial_instances = _limit_virtual_fields(train_instances, virtual_fields)
+        trial_output = search_root / "screen" / f"trial_{trial:02d}"
+        trial_output.mkdir(parents=True, exist_ok=True)
+        (trial_output / "search_config.json").write_text(
+            json.dumps({**asdict(trial_config), "virtual_fields": virtual_fields}, indent=2) + "\n", encoding="utf-8"
+        )
+        checkpoint = train(trial_instances, trial_config, trial_output, validation_instances)
+        validation = _validation_from_checkpoint(checkpoint)
+        screening.append({
+            "trial": trial,
+            "learning_rate": learning_rate,
+            "virtual_fields": virtual_fields,
+            "energy_weight": energy_weight,
+            "seed": trial_config.seed,
+            "checkpoint": str(checkpoint),
+            "validation": validation,
+        })
+        (search_root / "screening_results.json").write_text(json.dumps(screening, indent=2) + "\n", encoding="utf-8")
+
+    finalists = sorted(screening, key=lambda item: _rank_key(item["validation"]), reverse=True)[:3]
+    repeated: list[dict[str, object]] = []
+    for finalist_rank, finalist in enumerate(finalists, start=1):
+        for seed_offset in range(3):
+            seed = int(base_config.seed) + seed_offset
+            run_config = replace(
+                base_config,
+                seed=seed,
+                learning_rate=float(finalist["learning_rate"]),
+                energy_weight=float(finalist["energy_weight"]),
+            )
+            virtual_fields = int(finalist["virtual_fields"])
+            trial_instances = _limit_virtual_fields(train_instances, virtual_fields)
+            run_output = search_root / "replicates" / f"candidate_{finalist_rank:02d}" / f"seed_{seed}"
+            checkpoint = train(trial_instances, run_config, run_output, validation_instances)
+            validation = _validation_from_checkpoint(checkpoint)
+            repeated.append({
+                "candidate_rank": finalist_rank,
+                "learning_rate": run_config.learning_rate,
+                "virtual_fields": virtual_fields,
+                "energy_weight": run_config.energy_weight,
+                "seed": seed,
+                "checkpoint": str(checkpoint),
+                "validation": validation,
+            })
+
+    aggregate: list[dict[str, object]] = []
+    for finalist_rank, finalist in enumerate(finalists, start=1):
+        runs = [item for item in repeated if item["candidate_rank"] == finalist_rank]
+        mean_feasible = sum(item["validation"]["feasible_rate"] for item in runs) / len(runs)
+        mean_flight = sum(item["validation"]["mean_normalized_flight_cost"] for item in runs) / len(runs)
+        aggregate.append({
+            "candidate_rank": finalist_rank,
+            "learning_rate": finalist["learning_rate"],
+            "virtual_fields": finalist["virtual_fields"],
+            "energy_weight": finalist["energy_weight"],
+            "mean_feasible_rate": mean_feasible,
+            "mean_normalized_flight_cost": mean_flight,
+            "runs": runs,
+        })
+    selected = max(aggregate, key=lambda item: (item["mean_feasible_rate"], -item["mean_normalized_flight_cost"]))
+    chosen_run = max(
+        [item for item in repeated if item["candidate_rank"] == selected["candidate_rank"]],
+        key=lambda item: _rank_key(item["validation"]),
+    )
+    final_dir = search_root / "final"
+    final_dir.mkdir(parents=True, exist_ok=True)
+    final_checkpoint = final_dir / "best.pt"
+    shutil.copy2(chosen_run["checkpoint"], final_checkpoint)
+    report = {
+        "search_space": {
+            "learning_rate": [3e-5, 1e-4, 3e-4],
+            "virtual_fields": [32, 64],
+            "energy_weight": [0.25, 0.5],
+            "distance_weight": 1.0,
+            "completion_bonus": 5.0,
+            "safety_penalty": 20.0,
+        },
+        "selection_rule": "mean feasible rate, then mean normalized flight cost across 3 seeds",
+        "screening": screening,
+        "top_three_replicates": repeated,
+        "candidate_summary": aggregate,
+        "selected_candidate": selected,
+        "selected_checkpoint": str(final_checkpoint),
+    }
+    (search_root / "search_results.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    return final_checkpoint
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Train or evaluate the wind-aware pointer network.")
-    parser.add_argument("mode", choices=("prepare_data", "train", "resume", "evaluate"))
-    parser.add_argument("--input", type=Path, default=ROOT.parent / "turbine102.tsv")
+    parser.add_argument("mode", choices=("prepare_data", "train", "resume", "search", "evaluate"))
+    parser.add_argument("--input", type=Path, help="Defaults to turbine102.tsv for training and turbine87.tsv for evaluation.")
     parser.add_argument("--stage1-config", type=Path, default=ROOT.parent / "stage1" / "config.json")
     parser.add_argument("--regions-json", type=Path, help="Existing Stage-1 region JSON, for evaluation.")
     parser.add_argument("--config", type=Path, default=ROOT / "config.json")
@@ -39,97 +220,114 @@ def main() -> int:
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--batches-per-epoch", type=int)
     parser.add_argument("--virtual-fields", type=int)
+    parser.add_argument("--validation-fields", type=int)
+    parser.add_argument("--learning-rate", type=float)
+    parser.add_argument("--energy-weight", type=float)
+    parser.add_argument("--gust-speed-mps", type=float)
     parser.add_argument("--evaluation-output", type=Path)
     parser.add_argument("--random-samples", type=int, default=1000)
     parser.add_argument("--evaluation-seed", type=int, default=1234)
     parser.add_argument("--plot-dpi", type=int, default=300)
     args = parser.parse_args()
+    args.input = _resolve_input_path(args.mode, args.input)
 
     saved_config = json.loads(args.config.read_text(encoding="utf-8"))
-    for name in ("device", "epochs", "batch_size", "batches_per_epoch", "virtual_fields"):
+    for name in ("device", "epochs", "batch_size", "batches_per_epoch", "virtual_fields", "learning_rate", "energy_weight", "gust_speed_mps"):
         value = getattr(args, name)
         if value is not None:
             saved_config[name] = value
     device = str(saved_config["device"])
+    validation_fields = (
+        args.validation_fields if args.validation_fields is not None
+        else int(saved_config.get("validation_fields", 16))
+    )
+    gust_speed_mps = float(saved_config.get("gust_speed_mps", 12.0))
+
+    if args.mode == "evaluate":
+        instances = load_region_instances(args.regions_json, args.stage1_config, gust_speed_mps) if args.regions_json else build_deployment_instances(args.input, args.stage1_config, gust_speed_mps)
+        if args.checkpoint is None:
+            parser.error("evaluate requires --checkpoint PATH")
+        if args.random_samples < 1:
+            parser.error("--random-samples must be positive")
+        return _evaluate(args, parser, instances, device)
 
     if args.regions_json is not None:
-        instances = load_region_instances(args.regions_json, args.stage1_config)
-    else:
-        instances = build_deployment_instances(args.input, args.stage1_config)
-    virtual_fields = int(saved_config.get("virtual_fields", 0))
-    if virtual_fields and args.mode in {"prepare_data", "train", "resume"}:
-        instances.extend(build_kde_instances(args.input, args.stage1_config, virtual_fields, int(saved_config["seed"])))
-
-    args.output.mkdir(parents=True, exist_ok=True)
-    (args.output / "training_regions.json").write_text(
-        json.dumps(_instances_as_dict(instances), ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        parser.error("--regions-json is evaluation-only; train and search from turbine102.tsv.")
+    if validation_fields < 1:
+        parser.error("--validation-fields must be positive")
+    virtual_fields = int(saved_config.get("virtual_fields", 32))
+    max_fields = 64 if args.mode == "search" else virtual_fields
+    train_instances, validation_instances = build_training_validation_instances(
+        args.input, args.stage1_config, max_fields, int(saved_config["seed"]), validation_fields, gust_speed_mps,
     )
-    input_hashes = {
-        "turbine_tsv_sha256": hashlib.sha256(args.input.read_bytes()).hexdigest(),
-        "stage1_config_sha256": hashlib.sha256(args.stage1_config.read_bytes()).hexdigest(),
-    }
-    (args.output / "input_hashes.json").write_text(json.dumps(input_hashes, indent=2) + "\n", encoding="utf-8")
-
+    if args.mode == "search":
+        virtual_fields = max_fields
+    args.output.mkdir(parents=True, exist_ok=True)
+    _write_split_manifest(args.output, "training", train_instances)
+    _write_split_manifest(args.output, "validation", validation_instances)
+    input_hashes = _write_data_manifest(
+        args.output, args.input, args.stage1_config, int(saved_config["seed"]), virtual_fields,
+        validation_fields, gust_speed_mps,
+    )
     if args.mode == "prepare_data":
-        print(f"Prepared {len(instances)} Stage-1 routing regions.")
+        print(f"Prepared {len(train_instances)} training and {len(validation_instances)} validation regions.")
         return 0
 
-    if args.mode in {"train", "resume"}:
-        if args.regions_json is not None:
-            parser.error("--regions-json is evaluation-only; train from turbine102.tsv.")
-        from dataclasses import fields
+    from .train import TrainingConfig, train
 
-        from .train import TrainingConfig, train
-
+    config_fields = {field.name for field in fields(TrainingConfig)}
+    training_options = {key: value for key, value in saved_config.items() if key in config_fields}
+    training_config = TrainingConfig(**training_options)
+    if args.mode == "search":
+        checkpoint = _run_search(train_instances, validation_instances, training_config, args.output)
+    else:
+        selected_train_instances = _limit_virtual_fields(train_instances, virtual_fields)
         if args.mode == "resume" and args.checkpoint is None:
             parser.error("resume requires --checkpoint PATH")
-        training_options = {field.name: saved_config[field.name] for field in fields(TrainingConfig)}
         checkpoint = train(
-            instances,
-            TrainingConfig(**training_options),
+            selected_train_instances,
+            training_config,
             args.output,
+            validation_instances,
             resume_checkpoint=args.checkpoint if args.mode == "resume" else None,
         )
-        print(f"Saved checkpoint: {checkpoint}")
-        return 0
+    (args.output / "input_hashes.json").write_text(json.dumps(input_hashes, indent=2) + "\n", encoding="utf-8")
+    print(f"Saved validation-selected checkpoint: {checkpoint}")
+    return 0
 
-    if args.checkpoint is None:
-        parser.error("evaluate requires --checkpoint PATH")
-    if args.random_samples < 1:
-        parser.error("--random-samples must be positive")
 
+def _evaluate(args: argparse.Namespace, parser: argparse.ArgumentParser, instances: list[object], device: str) -> int:
     import torch
 
     from stage1.deployment import load_config
-
-    from .evaluation import (
-        evaluate_route,
-        nearest_neighbor_route,
-        random_route_summary,
-        write_evaluation_artifacts,
-    )
+    from .evaluation import evaluate_route, nearest_neighbor_route, random_route_summary, write_evaluation_artifacts
     from .model import GraphPointerNetwork, make_node_features
-    from .train import directed_time_matrix
 
     payload = torch.load(args.checkpoint, map_location=device, weights_only=False)
     config = payload["training_config"]
+    trained_environment = payload.get("wind_environment", {})
+    if trained_environment:
+        from dataclasses import replace
+        from .atsp import WindATSPConfig
+
+        instances = [
+            replace(instance, config=WindATSPConfig(**trained_environment))
+            for instance in instances
+        ]
     model = GraphPointerNetwork(config["hidden_dim"], config["encoder_layers"], config["heads"]).to(device)
     model.load_state_dict(payload["model"])
     model.eval()
-
     evaluations = []
     for region, instance in enumerate(instances, start=1):
         coordinates = torch.tensor(instance.coordinates_km, dtype=torch.float32, device=device).unsqueeze(0)
-        features = make_node_features(coordinates, instance.config.wind_speed_mps, instance.config.wind_direction_degrees)
-        time_matrix = directed_time_matrix(coordinates, instance)
+        features = make_node_features(
+            coordinates,
+            instance.config.wind_speed_mps,
+            instance.config.wind_direction_degrees,
+            instance.config.gust_speed_mps,
+        )
         with torch.no_grad():
-            order, _ = model(
-                features,
-                decode_type="greedy",
-                travel_time_seconds=time_matrix,
-                hover_equivalent_seconds=instance.config.hover_equivalent_seconds,
-                max_endurance_seconds=instance.config.max_endurance_seconds,
-            )
+            order, _ = model(features, decode_type="greedy")
         route = (0, *(int(index) for index in order[0].cpu().tolist()), 0)
         model_report = evaluate_route(instance, "model_greedy", route)
         nearest_report = evaluate_route(instance, "nearest_neighbor", nearest_neighbor_route(instance))
@@ -139,13 +337,15 @@ def main() -> int:
             f"Region {region:02d} | nest={instance.identifiers[0]} | nodes={instance.node_count} | "
             f"model={model_report.equivalent_energy_seconds:.2f}s ({model_report.feasible}) | "
             f"nearest={nearest_report.equivalent_energy_seconds:.2f}s ({nearest_report.feasible}) | "
-            f"random feasible={random_report.feasible_count}/{random_report.sample_count}",
-            flush=True,
+            f"random feasible={random_report.feasible_count}/{random_report.sample_count}", flush=True,
         )
-
     source_name = (args.regions_json or args.input).stem
     evaluation_output = args.evaluation_output or args.output / "evaluations" / f"{source_name}_{args.checkpoint.stem}"
-    input_hashes["checkpoint_sha256"] = hashlib.sha256(args.checkpoint.read_bytes()).hexdigest()
+    input_hashes = {
+        "test_input_sha256": hashlib.sha256((args.regions_json or args.input).read_bytes()).hexdigest(),
+        "stage1_config_sha256": hashlib.sha256(args.stage1_config.read_bytes()).hexdigest(),
+        "checkpoint_sha256": hashlib.sha256(args.checkpoint.read_bytes()).hexdigest(),
+    }
     write_evaluation_artifacts(
         output=evaluation_output,
         evaluations=evaluations,
@@ -154,7 +354,18 @@ def main() -> int:
         service_radius_km=load_config(args.stage1_config).communication_radius_km,
         plot_dpi=args.plot_dpi,
     )
-    print(f"Evaluated {len(evaluations)} routing regions. Results: {evaluation_output}")
+    summary_path = evaluation_output / "evaluation_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["training_config"] = config
+    summary["training_wind_environment"] = trained_environment
+    summary["checkpoint_selection_rule"] = payload.get("selection_rule", "legacy checkpoint; selection rule unavailable")
+    summary["test_selection_note"] = "Test metrics are reporting-only and are not used for checkpoint or hyperparameter selection."
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    (evaluation_output / "test_regions.json").write_text(
+        json.dumps({"split": "test", "regions": _instances_as_dict(instances)}, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"Evaluated {len(instances)} routing regions. Results: {evaluation_output}")
     return 0
 
 

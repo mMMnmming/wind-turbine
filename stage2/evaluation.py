@@ -303,15 +303,25 @@ def write_evaluation_artifacts(
         "checkpoint": str(checkpoint_path),
         "input_hashes": input_hashes,
         "region_count": len(evaluations),
+        "gust_speed_mps": sorted({instance.config.gust_speed_mps for _, instance, _, _, _ in evaluations}),
         "method_summary": {
             method: {
                 "mean_equivalent_energy_seconds": float(mean(float(row["equivalent_energy_seconds"]) for row in rows if row["method"] == method and row["equivalent_energy_seconds"] != "")),
+                "mean_flight_seconds": float(mean(float(row["flight_seconds"]) for row in rows if row["method"] == method and row["flight_seconds"] != "")),
+                "mean_route_distance_km": float(mean(float(row["route_distance_km"]) for row in rows if row["method"] == method and row["route_distance_km"] != "")),
                 "feasible_route_rate": float(mean(bool(row["feasible"]) for row in rows if row["method"] == method)),
             }
             for method in ("model_greedy", "nearest_neighbor", "random_seeded_median_feasible")
             if any(row["method"] == method and row["equivalent_energy_seconds"] != "" for row in rows)
         },
     }
+    if "model_greedy" in summary["method_summary"] and "nearest_neighbor" in summary["method_summary"]:
+        model_flight = summary["method_summary"]["model_greedy"]["mean_flight_seconds"]
+        nearest_flight = summary["method_summary"]["nearest_neighbor"]["mean_flight_seconds"]
+        summary["model_vs_nearest_neighbor"] = {
+            "mean_flight_seconds_reduction": nearest_flight - model_flight,
+            "mean_flight_seconds_reduction_fraction": (nearest_flight - model_flight) / nearest_flight if nearest_flight else 0.0,
+        }
     (output / "evaluation_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     log_lines = [f"Checkpoint: {checkpoint_path}", f"Regions: {len(evaluations)}"]
     for region, instance, model, nearest, random_summary in evaluations:

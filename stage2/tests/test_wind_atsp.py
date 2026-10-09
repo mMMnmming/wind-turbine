@@ -31,11 +31,11 @@ class WindATSPTests(unittest.TestCase):
             config=self.config,
         )
 
-    def test_east_wind_creates_an_asymmetric_time_matrix(self) -> None:
-        self.assertNotEqual(
-            self.instance.travel_time_seconds[0, 2],
-            self.instance.travel_time_seconds[2, 0],
-        )
+    def test_paper_compass_east_wind_maps_to_positive_x(self) -> None:
+        eastbound = self.instance.travel_time_seconds[0, 1]
+        westbound = self.instance.travel_time_seconds[1, 0]
+
+        self.assertLess(eastbound, westbound)
 
     def test_valid_route_starts_and_ends_at_depot_once_per_turbine(self) -> None:
         metrics = self.instance.evaluate_route((0, 1, 2, 0))
@@ -54,19 +54,31 @@ class WindATSPTests(unittest.TestCase):
         self.assertFalse(mask[1])
         self.assertTrue(mask[2])
 
-    def test_pointer_decoder_applies_dynamic_endurance_mask(self) -> None:
+    def test_pointer_decoder_visits_only_valid_clients_without_nearest_neighbor_mask(self) -> None:
         if torch is None:
             self.skipTest("PyTorch is not usable in this interpreter.")
         from stage2.model import GraphPointerNetwork
 
         model = GraphPointerNetwork(hidden_dim=8, encoder_layers=1, heads=2)
-        features = torch.zeros(1, 3, 6)
-        times = torch.tensor([[[0.0, 8.0, 1.0], [8.0, 0.0, 1.0], [1.0, 1.0, 0.0]]])
+        features = torch.zeros(2, 4, 7)
+        valid = torch.tensor([[True, True, True, False], [True, True, False, False]])
         route, _ = model(
-            features, decode_type="greedy", travel_time_seconds=times,
-            hover_equivalent_seconds=0.0, max_endurance_seconds=10.0,
+            features, decode_type="greedy", valid_node_mask=valid,
         )
-        self.assertEqual(route[0, 0].item(), 2)
+        self.assertEqual(set(route[0].tolist()), {1, 2})
+        self.assertEqual(route[1, 0].item(), 1)
+
+    def test_node_features_include_fixed_design_gust(self) -> None:
+        if torch is None:
+            self.skipTest("PyTorch is not usable in this interpreter.")
+        from stage2.model import make_node_features
+
+        coordinates = torch.tensor([[[0.0, 0.0], [1.0, 0.0]]])
+        features = make_node_features(coordinates, 6.0, 90.0, 12.0)
+
+        self.assertEqual(features.shape, (1, 2, 7))
+        self.assertAlmostEqual(features[0, 0, 4].item(), 1.0, places=6)
+        self.assertAlmostEqual(features[0, 0, 6].item(), 12.0 / 23.0, places=6)
 
 
 if __name__ == "__main__":
