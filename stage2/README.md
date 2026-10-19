@@ -26,6 +26,8 @@ python -m stage2.run prepare_data \
 
 训练集 = 102 数据经 Stage1 得到的真实区域 + 配置指定的 KDE 随机拓扑；验证集为同一空间分布用独立种子生成的 16 个拓扑场。输出分别为 `training_regions.json`、`validation_regions.json` 和 `data_manifest.json`。Stage1 不会被修改。平均风速取 Stage1 配置值（论文设定为 6 m/s），设计阵风默认为 12 m/s，作为状态特征；不生成或假设阵风概率分布。风向采用论文罗盘角约定（0°北、90°东）。
 
+部分 KDE 随机拓扑可能无法通过 Stage1 最终分配的可行性检查。Stage2 会保留原约束，使用确定性的新种子重采样该拓扑，直到得到指定数量的有效拓扑；每个场最多尝试 `kde_max_attempts_per_field` 次（默认 20 次），耗尽后明确报错。失败原因会写入控制台/`nohup` 日志，所有尝试的种子、接受状态和区域数量写入 `data_manifest.json` 的 `kde_generation`。因此合成集是以 Stage1 部署可行为条件的 KDE 样本，训练集和验证集都采用这一筛选规则。原始 102/87 数据若部署失败仍直接报错。
+
 ## 单配置训练
 
 ```bash

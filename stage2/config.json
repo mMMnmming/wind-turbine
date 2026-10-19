@@ -16,5 +16,6 @@
   "safety_penalty": 20.0,
   "safety_overshoot_penalty": 10.0,
   "gust_speed_mps": 12.0,
-  "validation_fields": 16
+  "validation_fields": 16,
+  "kde_max_attempts_per_field": 20
 }

@@ -10,7 +10,12 @@ import json
 from pathlib import Path
 import shutil
 
-from .data import build_deployment_instances, build_training_validation_instances, load_region_instances
+from .data import (
+    KDE_RETRY_SEED_STRIDE,
+    build_deployment_instances,
+    build_training_validation_instances,
+    load_region_instances,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -53,6 +58,8 @@ def _write_data_manifest(
     virtual_fields: int,
     validation_fields: int,
     gust_speed_mps: float,
+    max_attempts_per_field: int = 20,
+    generation_records: dict[str, list[dict[str, object]]] | None = None,
 ) -> dict[str, str]:
     input_hashes = {
         "turbine_tsv_sha256": hashlib.sha256(input_path.read_bytes()).hexdigest(),
@@ -67,6 +74,12 @@ def _write_data_manifest(
         "validation_seed": seed + 1_000_000,
         "gust_speed_mps": gust_speed_mps,
         "input_hashes": input_hashes,
+        "kde_generation": {
+            "policy": "Deterministic rejection sampling conditional on Stage1 deployment feasibility.",
+            "max_attempts_per_field": max_attempts_per_field,
+            "retry_seed_stride": KDE_RETRY_SEED_STRIDE,
+            "attempts_by_split": generation_records or {},
+        },
         "note": "Validation KDE fields use a disjoint seed stream; test input is evaluated separately.",
     }
     (output / "data_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -242,6 +255,7 @@ def main() -> int:
         else int(saved_config.get("validation_fields", 16))
     )
     gust_speed_mps = float(saved_config.get("gust_speed_mps", 12.0))
+    max_kde_attempts = int(saved_config.get("kde_max_attempts_per_field", 20))
 
     if args.mode == "evaluate":
         instances = load_region_instances(args.regions_json, args.stage1_config, gust_speed_mps) if args.regions_json else build_deployment_instances(args.input, args.stage1_config, gust_speed_mps)
@@ -255,10 +269,14 @@ def main() -> int:
         parser.error("--regions-json is evaluation-only; train and search from turbine102.tsv.")
     if validation_fields < 1:
         parser.error("--validation-fields must be positive")
+    if max_kde_attempts < 1:
+        parser.error("kde_max_attempts_per_field must be positive")
     virtual_fields = int(saved_config.get("virtual_fields", 32))
     max_fields = 64 if args.mode == "search" else virtual_fields
+    generation_records: dict[str, list[dict[str, object]]] = {}
     train_instances, validation_instances = build_training_validation_instances(
         args.input, args.stage1_config, max_fields, int(saved_config["seed"]), validation_fields, gust_speed_mps,
+        max_attempts_per_field=max_kde_attempts, generation_records=generation_records,
     )
     if args.mode == "search":
         virtual_fields = max_fields
@@ -267,10 +285,16 @@ def main() -> int:
     _write_split_manifest(args.output, "validation", validation_instances)
     input_hashes = _write_data_manifest(
         args.output, args.input, args.stage1_config, int(saved_config["seed"]), virtual_fields,
-        validation_fields, gust_speed_mps,
+        validation_fields, gust_speed_mps, max_kde_attempts, generation_records,
+    )
+    rejected_draws = sum(
+        not record["accepted"] for records in generation_records.values() for record in records
+    )
+    print(
+        f"Prepared {len(train_instances)} training and {len(validation_instances)} validation regions "
+        f"from {virtual_fields}+{validation_fields} KDE fields; rejected draws={rejected_draws}.", flush=True,
     )
     if args.mode == "prepare_data":
-        print(f"Prepared {len(train_instances)} training and {len(validation_instances)} validation regions.")
         return 0
 
     from .train import TrainingConfig, train

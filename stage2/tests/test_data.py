@@ -4,16 +4,79 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
-from stage2.data import build_deployment_instances, build_training_validation_instances, sample_kde_topology
+from stage1.deployment import InfeasibleDeploymentError, Turbine, run_deployment
+from stage2.data import (
+    build_deployment_instances,
+    build_kde_instances,
+    build_training_validation_instances,
+    sample_kde_topology,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 class DataPreparationTests(unittest.TestCase):
+    def _small_source(self) -> list[Turbine]:
+        return [Turbine("A", 0.0, 0.0), Turbine("B", 0.1, 0.0),
+                Turbine("C", 0.0, 0.1), Turbine("D", 0.1, 0.1)]
+
+    def test_rejected_topology_is_replaced_reproducibly_without_reducing_field_count(self) -> None:
+        def generate():
+            records = []
+            calls = 0
+
+            def reject_first(turbines, config):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise InfeasibleDeploymentError("forced infeasible final assignment")
+                return run_deployment(turbines, config)
+
+            with patch("stage2.data.load_turbines", return_value=self._small_source()), patch(
+                "stage2.data.run_deployment", side_effect=reject_first
+            ):
+                instances = build_kde_instances(
+                    ROOT / "turbine102.tsv", ROOT / "stage1" / "config.json", 2, 1234,
+                    generation_records=records,
+                )
+            return instances, records
+
+        first, first_records = generate()
+        second, second_records = generate()
+        self.assertEqual(first_records, second_records)
+        self.assertFalse(first_records[0]["accepted"])
+        accepted = [record for record in first_records if record["accepted"]]
+        self.assertEqual([record["field_id"] for record in accepted], [0, 1])
+        self.assertEqual(accepted[1]["seed"], 1235)
+        self.assertNotEqual(accepted[0]["seed"], 1234)
+        self.assertEqual(len(first), len(second))
+        for left, right in zip(first, second):
+            np.testing.assert_array_equal(left.coordinates_km, right.coordinates_km)
+
+    def test_repeated_deployment_failure_stops_at_attempt_limit(self) -> None:
+        with patch("stage2.data.load_turbines", return_value=self._small_source()), patch(
+            "stage2.data.run_deployment", side_effect=InfeasibleDeploymentError("infeasible")
+        ) as deployment:
+            with self.assertRaisesRegex(InfeasibleDeploymentError, "after 2 attempts"):
+                build_kde_instances(
+                    ROOT / "turbine102.tsv", ROOT / "stage1" / "config.json", 1, 1234,
+                    max_attempts_per_field=2,
+                )
+        self.assertEqual(deployment.call_count, 2)
+
+    def test_unexpected_deployment_error_is_not_hidden_by_retries(self) -> None:
+        with patch("stage2.data.load_turbines", return_value=self._small_source()), patch(
+            "stage2.data.run_deployment", side_effect=ValueError("unexpected bug")
+        ) as deployment:
+            with self.assertRaisesRegex(ValueError, "unexpected bug"):
+                build_kde_instances(ROOT / "turbine102.tsv", ROOT / "stage1" / "config.json", 1, 1234)
+        self.assertEqual(deployment.call_count, 1)
+
     def test_walney_102_generates_three_training_regions(self) -> None:
         instances = build_deployment_instances(ROOT / "turbine102.tsv", ROOT / "stage1" / "config.json")
 

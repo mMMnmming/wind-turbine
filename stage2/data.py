@@ -4,13 +4,18 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import logging
 
 import numpy as np
 from scipy.stats import gaussian_kde
 
-from stage1.deployment import Turbine, load_config, load_turbines, run_deployment
+from stage1.deployment import InfeasibleDeploymentError, Turbine, load_config, load_turbines, run_deployment
 
 from .atsp import WindATSPConfig, WindATSPInstance
+
+
+LOGGER = logging.getLogger(__name__)
+KDE_RETRY_SEED_STRIDE = 2**32
 
 
 def build_deployment_instances(
@@ -58,15 +63,24 @@ def build_kde_instances(
     seed: int,
     field_offset: int = 0,
     gust_speed_mps: float = 12.0,
+    max_attempts_per_field: int = 20,
+    generation_records: list[dict[str, object]] | None = None,
 ) -> list[WindATSPInstance]:
     """Generate seeded virtual farms, rerun Stage 1, and return legal ATSP groups.
 
     The KDE is fitted to Walney-102 coordinates.  Every sampled topology is
     passed back through the same Stage-1 deployment routine used for real
-    data; no synthetic grouping is fabricated in Stage 2.
+    data; no synthetic grouping is fabricated in Stage 2. Rejected synthetic
+    deployments are replaced with seeded draws under the same constraints.
+    A field's first seed remains ``seed + field_index``; retry ``k`` adds
+    ``k * 2**32``, keeping retries out of the initial train/validation streams.
     """
     if field_count < 1:
         raise ValueError("field_count must be positive.")
+    if max_attempts_per_field < 1:
+        raise ValueError("max_attempts_per_field must be positive.")
+    if seed < 0 or seed + field_count > KDE_RETRY_SEED_STRIDE:
+        raise ValueError("Initial KDE seeds must lie in [0, 2**32) to keep retry streams disjoint.")
     deployment_config = load_config(deployment_config_path)
     source_turbines = load_turbines(turbine_path)
     source_points = np.array([(item.x_km, item.y_km) for item in source_turbines], dtype=float)
@@ -81,20 +95,51 @@ def build_kde_instances(
     )
     instances: list[WindATSPInstance] = []
     for field_index in range(field_count):
-        coordinates = sample_kde_topology(source_points, len(source_turbines), seed + field_index)
         field_id = field_index + field_offset
-        turbines = [Turbine(f"virtual-{field_id:05d}-{index:03d}", float(x), float(y)) for index, (x, y) in enumerate(coordinates)]
-        deployment = run_deployment(turbines, deployment_config)
-        by_identifier = {item.identifier: item for item in turbines}
-        for nest in deployment.nests:
-            client_ids = tuple(item for item in nest.turbine_ids if item != nest.identifier)
-            identifiers = (nest.identifier, *client_ids)
-            node_coordinates = np.array([(by_identifier[item].x_km, by_identifier[item].y_km) for item in identifiers])
-            instance = WindATSPInstance(identifiers, node_coordinates, 0, routing_config)
-            # Stage 1 validates its nearest-neighbour closed route.  Retain a
-            # second explicit validation point for future alternate generators.
-            if instance.node_count > 1:
-                instances.append(instance)
+        for attempt in range(max_attempts_per_field):
+            sample_seed = seed + field_index + attempt * KDE_RETRY_SEED_STRIDE
+            coordinates = sample_kde_topology(source_points, len(source_turbines), sample_seed)
+            turbines = [
+                Turbine(f"virtual-{field_id:05d}-{index:03d}", float(x), float(y))
+                for index, (x, y) in enumerate(coordinates)
+            ]
+            record: dict[str, object] = {
+                "field_id": field_id, "attempt": attempt + 1, "seed": sample_seed,
+            }
+            try:
+                deployment = run_deployment(turbines, deployment_config)
+                if not any(len(set(nest.turbine_ids) - {nest.identifier}) > 0 for nest in deployment.nests):
+                    raise InfeasibleDeploymentError("Synthetic deployment has no multi-node routing regions.")
+            except InfeasibleDeploymentError as exc:
+                record.update(accepted=False, reason=str(exc))
+                if generation_records is not None:
+                    generation_records.append(record)
+                LOGGER.warning(
+                    "Rejected KDE field=%s seed=%s attempt=%s/%s: %s",
+                    field_id, sample_seed, attempt + 1, max_attempts_per_field, exc,
+                )
+                if attempt + 1 == max_attempts_per_field:
+                    raise InfeasibleDeploymentError(
+                        f"Unable to generate feasible KDE field {field_id} after {max_attempts_per_field} attempts "
+                        f"(initial seed={seed + field_index}). Last rejection: {exc}"
+                    ) from exc
+                continue
+
+            by_identifier = {item.identifier: item for item in turbines}
+            field_instances: list[WindATSPInstance] = []
+            for nest in deployment.nests:
+                client_ids = tuple(item for item in nest.turbine_ids if item != nest.identifier)
+                identifiers = (nest.identifier, *client_ids)
+                node_coordinates = np.array([
+                    (by_identifier[item].x_km, by_identifier[item].y_km) for item in identifiers
+                ])
+                if len(identifiers) > 1:
+                    field_instances.append(WindATSPInstance(identifiers, node_coordinates, 0, routing_config))
+            record.update(accepted=True, region_count=len(field_instances))
+            if generation_records is not None:
+                generation_records.append(record)
+            instances.extend(field_instances)
+            break
     return instances
 
 
@@ -105,6 +150,8 @@ def build_training_validation_instances(
     seed: int,
     validation_fields: int = 16,
     gust_speed_mps: float = 12.0,
+    max_attempts_per_field: int = 20,
+    generation_records: dict[str, list[dict[str, object]]] | None = None,
 ) -> tuple[list[WindATSPInstance], list[WindATSPInstance]]:
     """Build 102-site deployment training regions and disjoint KDE validation fields."""
     if virtual_fields < 1 or validation_fields < 1:
@@ -113,6 +160,8 @@ def build_training_validation_instances(
     train.extend(build_kde_instances(
         turbine_path, deployment_config_path, virtual_fields, seed, field_offset=0,
         gust_speed_mps=gust_speed_mps,
+        max_attempts_per_field=max_attempts_per_field,
+        generation_records=generation_records.setdefault("training", []) if generation_records is not None else None,
     ))
     validation = build_kde_instances(
         turbine_path,
@@ -121,6 +170,8 @@ def build_training_validation_instances(
         seed + 1_000_000,
         field_offset=1_000_000,
         gust_speed_mps=gust_speed_mps,
+        max_attempts_per_field=max_attempts_per_field,
+        generation_records=generation_records.setdefault("validation", []) if generation_records is not None else None,
     )
     return train, validation
 
