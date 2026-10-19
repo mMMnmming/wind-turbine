@@ -1,0 +1,19 @@
+{
+  "split": "smoke_only_not_training_or_validation",
+  "regions": [
+    {
+      "identifiers": ["D", "A", "B", "C"],
+      "coordinates_km": [[0.0, 0.0], [0.1, 0.0], [0.2, 0.3], [0.4, 0.1]],
+      "depot_index": 0,
+      "config": {
+        "wind_speed_mps": 6.0,
+        "wind_direction_degrees": 90.0,
+        "gust_speed_mps": 12.0,
+        "max_horizontal_speed_mps": 23.0,
+        "max_endurance_seconds": 1000.0,
+        "hover_seconds_per_turbine": 10.0,
+        "hover_to_flight_energy_ratio": 1.14
+      }
+    }
+  ]
+}

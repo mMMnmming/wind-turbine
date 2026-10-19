@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import random
 import time
+import warnings
 
 import numpy as np
 import torch
@@ -14,6 +15,8 @@ from torch import Tensor
 
 from .atsp import WindATSPInstance
 from .model import GraphPointerNetwork, make_node_features
+from .data import instance_fingerprint, split_fingerprint
+from .pool import TrainingPool, sample_training_indices
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +36,7 @@ class TrainingConfig:
     completion_bonus: float = 5.0
     safety_penalty: float = 20.0
     safety_overshoot_penalty: float = 10.0
+    stratified_sampling: bool = False
 
 
 def require_device(requested: str) -> torch.device:
@@ -153,16 +157,22 @@ def evaluate_policy(
     instances: list[WindATSPInstance],
     config: TrainingConfig,
     device: torch.device,
+    references: dict[str, dict] | None = None,
 ) -> dict[str, float]:
     """Greedy validation; feasibility is primary, flight-time cost secondary."""
     if not instances:
         raise ValueError("Validation requires at least one routing instance.")
+    was_training = model.training
     model.eval()
     feasible_count = 0
     flight_costs: list[float] = []
     energy_costs: list[float] = []
     distances: list[float] = []
     rewards: list[float] = []
+    relative_nn_improvements: list[float] = []
+    predictions: list[tuple[WindATSPInstance, float, bool]] = []
+    by_size: dict[int, list[tuple[float, bool]]] = {}
+    from .evaluation import nearest_neighbor_route
     for instance in instances:
         coordinates, valid, times, hover, endurance = _pad_instance_batch([instance], device)
         features = _batch_features(coordinates, valid, [instance])
@@ -174,15 +184,54 @@ def evaluate_policy(
         energy_costs.append(float((energy / endurance).item()))
         distances.append(float(distance.item()))
         rewards.append(float(_reward(flight, energy, feasible, endurance, config).item()))
-    model.train()
-    return {
+        flight_value = float(flight.item())
+        nearest = instance.evaluate_route(nearest_neighbor_route(instance)).flight_seconds
+        relative_nn_improvements.append((nearest - flight_value) / max(nearest, 1e-9))
+        predictions.append((instance, flight_value, feasible_value))
+        by_size.setdefault((instance.node_count - 2) // 10, []).append((float((flight / endurance).item()), feasible_value))
+    model.train(was_training)
+    result = {
         "feasible_rate": feasible_count / len(instances),
         "mean_normalized_flight_cost": float(np.mean(flight_costs)),
         "mean_normalized_energy": float(np.mean(energy_costs)),
         "mean_distance_km": float(np.mean(distances)),
         "mean_reward": float(np.mean(rewards)),
         "instance_count": float(len(instances)),
+        "mean_relative_nn_improvement": float(np.mean(relative_nn_improvements)),
     }
+    for bucket, entries in by_size.items():
+        label = f"clients_{bucket * 10 + 1}_{bucket * 10 + 10}"
+        result[f"{label}_count"] = float(len(entries))
+        result[f"{label}_feasible_rate"] = float(np.mean([item[1] for item in entries]))
+        result[f"{label}_normalized_flight_cost"] = float(np.mean([item[0] for item in entries]))
+    if references is not None:
+        from .benchmark import reference_summary
+        result.update(reference_summary(predictions, references))
+    return result
+
+
+def _capture_rng_state(generator: np.random.Generator) -> dict[str, object]:
+    return {
+        "batch_generator": generator.bit_generator.state, "python": random.getstate(),
+        "numpy": np.random.get_state(), "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def _restore_rng_state(state: dict[str, object], generator: np.random.Generator) -> None:
+    generator.bit_generator.state = state["batch_generator"]
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"].cpu())
+    if state["cuda"] is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all([item.cpu() for item in state["cuda"]])
+
+
+def _save_checkpoint(payload: dict[str, object], path: Path) -> None:
+    """Avoid destroying the last complete checkpoint if a write is interrupted."""
+    temporary = path.with_suffix(".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
 
 
 def validation_is_better(candidate: dict[str, float], incumbent: dict[str, float] | None) -> bool:
@@ -214,12 +263,25 @@ def train(
     output: Path,
     validation_instances: list[WindATSPInstance],
     resume_checkpoint: Path | None = None,
+    pool: TrainingPool | None = None,
+    references: dict[str, dict] | None = None,
 ) -> Path:
     """Train one policy over diverse regions and select best by held-out validation."""
     if not instances:
         raise ValueError("At least one Stage-1 or synthetic routing instance is required.")
     if not validation_instances:
         raise ValueError("At least one independent validation instance is required.")
+    if min(config.batch_size, config.batches_per_epoch, config.epochs) < 1:
+        raise ValueError("Batch size, batches per epoch, and total epochs must be positive.")
+    if resume_checkpoint is None and any((output / name).exists() for name in ("latest.pt", "best.pt")):
+        raise ValueError("Training output already contains checkpoints. Use a fresh output or resume explicitly.")
+    initial_fingerprint = split_fingerprint(instances)
+    validation_fingerprint = split_fingerprint(validation_instances)
+    if pool is not None and (split_fingerprint(pool.instances) != initial_fingerprint
+                             or split_fingerprint(pool.validation_instances) != validation_fingerprint):
+        raise ValueError("The training pool and supplied training/validation splits differ.")
+    if references is not None and set(references) - {instance_fingerprint(item) for item in validation_instances}:
+        raise ValueError("Reference results do not belong to the validation split.")
     device = require_device(config.device)
     set_seed(config.seed)
     output.mkdir(parents=True, exist_ok=True)
@@ -228,39 +290,61 @@ def train(
     baseline.load_state_dict(model.state_dict())
     baseline.eval()
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
-    history: list[dict[str, float]] = []
+    history: list[dict[str, object]] = []
     metrics_path = output / "metrics.jsonl"
-    if resume_checkpoint is None:
-        metrics_path.write_text("", encoding="utf-8")
     start_epoch = 0
+    generator = np.random.default_rng(config.seed)
+    payload = None
+    environment = asdict(instances[0].config)
+    if any(asdict(instance.config) != environment for instance in instances):
+        raise ValueError("Training instances must share one wind and endurance configuration.")
     if resume_checkpoint is not None:
-        payload = torch.load(resume_checkpoint, map_location=device, weights_only=False)
-        environment = asdict(instances[0].config)
-        if any(asdict(instance.config) != environment for instance in instances):
-            raise ValueError("Training instances must share one wind and endurance configuration.")
+        payload = torch.load(resume_checkpoint, map_location="cpu", weights_only=False)
         validate_resume_environment(payload.get("wind_environment"), environment)
+        for key, value in asdict(config).items():
+            if key not in ("epochs", "device") and key in payload["training_config"]:
+                if payload["training_config"][key] != value:
+                    raise ValueError(f"Resume training setting changed: {key}. Start a new run for comparisons.")
+        if payload.get("validation_fingerprint", validation_fingerprint) != validation_fingerprint:
+            raise ValueError("Resume validation split differs from the checkpoint.")
+        if payload.get("initial_training_fingerprint", initial_fingerprint) != initial_fingerprint:
+            raise ValueError("Resume initial training data differs from the checkpoint.")
+        saved_pool = payload.get("training_pool")
+        if saved_pool is not None:
+            if pool is None:
+                raise ValueError("This checkpoint requires its training pool and prepared data.")
+            pool.load_state_dict(saved_pool)
+            instances = pool.instances
+        elif pool is not None and pool.refresh_every_epochs:
+            raise ValueError("Old checkpoint has no refreshable training-pool state; start a fresh run.")
         model.load_state_dict(payload["model"])
         baseline.load_state_dict(payload["baseline"])
         optimizer.load_state_dict(payload["optimizer"])
         history = list(payload.get("history", []))
         start_epoch = int(payload["epoch"])
-    prior_validation = next((item["validation"] for item in reversed(history) if "validation" in item), None)
-    best_validation = prior_validation
-    best_epoch = int(next((item["epoch"] for item in reversed(history) if item.get("is_best") == 1.0), 0))
+    best_validation = payload.get("best_validation") if payload else None
+    best_epoch = int(payload.get("best_epoch", 0)) if payload else 0
     if resume_checkpoint is not None:
         source_best_path = resume_checkpoint.parent / "best.pt"
-        if (output / "best.pt").exists():
-            source_best_path = output / "best.pt"
-        elif source_best_path.exists():
-            best_payload = torch.load(source_best_path, map_location=device, weights_only=False)
-            torch.save(best_payload, output / "best.pt")
+        if not source_best_path.exists() and start_epoch == best_epoch:
+            source_best_path = resume_checkpoint
+        if not source_best_path.exists():
+            raise ValueError("Keep best.pt beside latest.pt when resuming; the earlier selected model is missing.")
+        best_payload = torch.load(source_best_path, map_location="cpu", weights_only=False)
+        if int(best_payload.get("epoch", 0)) != best_epoch:
+            raise ValueError("best.pt does not match the checkpoint's best epoch.")
+        if source_best_path.resolve() != (output / "best.pt").resolve():
+            if (output / "best.pt").exists():
+                raise ValueError("Resume destination already has a different best.pt. Use a fresh output directory.")
+            _save_checkpoint(best_payload, output / "best.pt")
+    metrics_path.write_text("".join(json.dumps(row) + "\n" for row in history), encoding="utf-8")
+    if pool is not None:
+        pool.write_snapshot(output / "pool_history")
+    if payload is not None:
+        if payload.get("rng_state") is not None:
+            _restore_rng_state(payload["rng_state"], generator)
         else:
-            best_payload = torch.load(resume_checkpoint, map_location=device, weights_only=False)
-            torch.save(best_payload, output / "best.pt")
-        best_payload = torch.load(source_best_path, map_location=device, weights_only=False) if source_best_path.exists() else best_payload
-        best_validation = best_payload.get("best_validation", best_validation)
-        best_epoch = int(best_payload.get("best_epoch", best_epoch))
-    generator = np.random.default_rng(config.seed)
+            warnings.warn("Legacy checkpoint has no RNG states; exact continuation cannot be reproduced.", RuntimeWarning)
     print(
         f"Training start | device={device} | train_instances={len(instances)} | "
         f"validation_instances={len(validation_instances)} | epochs={config.epochs} | "
@@ -268,14 +352,18 @@ def train(
     )
     for epoch in range(start_epoch, config.epochs):
         epoch_started = time.perf_counter()
+        if pool is not None and pool.maybe_refresh(epoch):
+            instances = pool.instances
+            pool.write_snapshot(output / "pool_history")
+            print(f"Refreshed pool v{pool.version} before epoch {epoch + 1}: "
+                  f"{len(instances)} regions; next field={pool.next_field_id}.", flush=True)
         model.train()
         losses: list[float] = []
         train_rewards: list[float] = []
         feasible_rates: list[float] = []
         gradient_norms: list[float] = []
         for _ in range(config.batches_per_epoch):
-            batch_size = min(config.batch_size, len(instances))
-            selected_indices = generator.choice(len(instances), size=batch_size, replace=False)
+            selected_indices = sample_training_indices(instances, config.batch_size, generator, config.stratified_sampling)
             selected_instances = [instances[int(index)] for index in selected_indices]
             coordinates, valid, times, hover, endurance = _pad_instance_batch(selected_instances, device)
             features = _batch_features(coordinates, valid, selected_instances)
@@ -298,7 +386,7 @@ def train(
             feasible_rates.append(float(feasible.float().mean().detach().cpu()))
             gradient_norms.append(float(gradient_norm.detach().cpu()))
 
-        validation = evaluate_policy(model, validation_instances, config, device)
+        validation = evaluate_policy(model, validation_instances, config, device, references)
         improved = validation_is_better(validation, best_validation)
         if improved:
             best_validation = validation
@@ -316,18 +404,25 @@ def train(
             "is_best": float(improved),
             "best_epoch": best_epoch,
             "best_validation": best_validation,
+            "pool_version": pool.version if pool is not None else 0,
+            "training_instance_count": len(instances),
+            "sampled_route_count": min(config.batch_size, len(instances)) * config.batches_per_epoch,
         }
-        history.append(epoch_metrics)  # type: ignore[arg-type]
+        history.append(epoch_metrics)
         payload = {
             "model": model.state_dict(), "baseline": baseline.state_dict(), "optimizer": optimizer.state_dict(),
             "epoch": epoch + 1, "training_config": asdict(config), "history": history,
             "validation_metrics": validation, "best_validation": best_validation,
             "best_epoch": best_epoch, "selection_rule": "feasible_rate_then_normalized_flight_cost",
             "wind_environment": asdict(instances[0].config),
+            "initial_training_fingerprint": initial_fingerprint, "validation_fingerprint": validation_fingerprint,
+            "training_pool": pool.state_dict() if pool is not None else None,
+            "rng_state": _capture_rng_state(generator),
+            "reference_results": references,
         }
-        torch.save(payload, output / "latest.pt")
+        _save_checkpoint(payload, output / "latest.pt")
         if improved:
-            torch.save(payload, output / "best.pt")
+            _save_checkpoint(payload, output / "best.pt")
         with metrics_path.open("a", encoding="utf-8") as metrics_file:
             metrics_file.write(json.dumps(epoch_metrics) + "\n")
         (output / "training_history.json").write_text(json.dumps(history, indent=2) + "\n", encoding="utf-8")
@@ -338,7 +433,11 @@ def train(
             f"val flight={validation['mean_normalized_flight_cost']:.4f} | "
             f"best epoch={best_epoch} | {epoch_metrics['epoch_seconds']:.1f}s", flush=True,
         )
-    (output / "config_snapshot.json").write_text(json.dumps(asdict(config), indent=2) + "\n", encoding="utf-8")
+    snapshot = {**asdict(config), "validation_fingerprint": validation_fingerprint,
+                "initial_training_fingerprint": initial_fingerprint,
+                "pool_settings": pool.state_dict()["settings"] if pool is not None else None,
+                "reference_results": references}
+    (output / "config_snapshot.json").write_text(json.dumps(snapshot, indent=2) + "\n", encoding="utf-8")
     (output / "training_history.json").write_text(json.dumps(history, indent=2) + "\n", encoding="utf-8")
     if not (output / "best.pt").exists():
         raise RuntimeError("Training completed without producing a validation-selected best checkpoint.")

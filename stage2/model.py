@@ -41,7 +41,7 @@ class GraphPointerNetwork(nn.Module):
         """
         if features.ndim != 3 or features.size(-1) != self.feature_count:
             raise ValueError(f"features must have shape (batch, nodes, {self.feature_count}).")
-        batch_size, node_count, hidden_dim = features.shape
+        batch_size, node_count, _ = features.shape
         if node_count < 2:
             raise ValueError("Each graph must contain a depot and at least one client.")
         if valid_node_mask is None:
@@ -61,7 +61,8 @@ class GraphPointerNetwork(nn.Module):
         client_counts = valid_node_mask.sum(dim=1) - 1
         selected: list[Tensor] = []
         log_probabilities: list[Tensor] = []
-        scale = hidden_dim**-0.5
+        # Dot products use the encoded width, not the seven input features.
+        scale = encoded.size(-1)**-0.5
         for step in range(int(client_counts.max().item())):
             active = step < client_counts
             query = self.query(query, depot)

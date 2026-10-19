@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import asdict
+import hashlib
 import json
 import logging
 
@@ -16,6 +18,35 @@ from .atsp import WindATSPConfig, WindATSPInstance
 
 LOGGER = logging.getLogger(__name__)
 KDE_RETRY_SEED_STRIDE = 2**32
+
+
+def instance_to_record(instance: WindATSPInstance) -> dict[str, object]:
+    """Serialize geometry and the full environment, independent of local paths."""
+    return {
+        "identifiers": list(instance.identifiers), "coordinates_km": instance.coordinates_km.tolist(),
+        "depot_index": instance.depot_index, "node_count": instance.node_count,
+        "config": asdict(instance.config),
+    }
+
+
+def instance_from_record(record: dict[str, object]) -> WindATSPInstance:
+    """Restore a complete prepared-data/checkpoint record."""
+    return WindATSPInstance(
+        tuple(record["identifiers"]), np.asarray(record["coordinates_km"], dtype=float),
+        int(record["depot_index"]), WindATSPConfig(**record["config"]),
+    )
+
+
+def instance_fingerprint(instance: WindATSPInstance) -> str:
+    """Identify the routing problem by geometry and physics, not node labels."""
+    record = instance_to_record(instance)
+    record.pop("identifiers")
+    return hashlib.sha256(json.dumps(record, sort_keys=True, allow_nan=False).encode("utf-8")).hexdigest()
+
+
+def split_fingerprint(instances: list[WindATSPInstance]) -> str:
+    """Hash an ordered split; its order affects seeded batch selection."""
+    return hashlib.sha256("\n".join(instance_fingerprint(item) for item in instances).encode()).hexdigest()
 
 
 def build_deployment_instances(
@@ -139,6 +170,9 @@ def build_kde_instances(
             if generation_records is not None:
                 generation_records.append(record)
             instances.extend(field_instances)
+            if (field_index + 1) % 16 == 0 or field_index + 1 == field_count:
+                LOGGER.info("Prepared KDE fields %s/%s (%s routing regions so far).",
+                            field_index + 1, field_count, len(instances))
             break
     return instances
 
@@ -201,7 +235,8 @@ def load_region_instances(
     return [
         WindATSPInstance(
             tuple(record["identifiers"]), np.asarray(record["coordinates_km"], dtype=float),
-            int(record.get("depot_index", 0)), routing_config,
+            int(record.get("depot_index", 0)),
+            WindATSPConfig(**record["config"]) if "config" in record else routing_config,
         )
         for record in records
     ]
