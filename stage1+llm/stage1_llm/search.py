@@ -140,7 +140,10 @@ class SearchController:
     def _observe_response(self, artifacts: RunArtifacts, message: str, fields: dict) -> None:
         candidate_id = self.pending['candidate_id'] if self.pending else 'unknown'
         kind = fields.pop('kind','api_request')
-        if kind == 'llm_response':
+        if kind == 'llm_text':
+            if self.settings.show_code:
+                artifacts.log(f"{candidate_id} {fields['text']}",event='llm_text',candidate_id=candidate_id)
+        elif kind == 'llm_response':
             path = f'responses/{candidate_id}.json'
             artifacts.write_json(path,fields)
             self.pending['response_path'] = path
@@ -148,8 +151,15 @@ class SearchController:
                           f"response_chars={fields.get('response_chars')} usage={fields.get('usage')} "
                           f"public_response={path}",event='llm_response',candidate_id=candidate_id,
                           response_path=path,finish_reason=fields.get('finish_reason'),usage=fields.get('usage'))
+            if not self.llm.stream and self.settings.show_code:
+                artifacts.log(f'{candidate_id} PUBLIC RESPONSE (non-streaming; not yet validated)\n'
+                              f"{fields.get('content') or '<empty final content>'}",event='llm_text')
         elif kind == 'llm_response_invalid':
             path = self.pending.get('response_path')
+            if not self.settings.show_code:
+                artifacts.log(f'{candidate_id} {message}; public body display disabled; diagnostic={path}',
+                              event=kind,candidate_id=candidate_id)
+                return
             content = getattr(self.client,'last_response',{}).get('content','')
             # Adapters may expose only last_metadata, so read the already saved
             # redacted public body instead of ever dumping a provider object.
@@ -170,16 +180,22 @@ class SearchController:
             'parent_diagnostic':parent['evaluation'] if parent else None,
         }
         # No protected coordinates, test results, API credentials or raw whole data.
-        text = json.dumps(feedback,ensure_ascii=False,default=str)
         if parent:
-            # Compact diagnostics but retain every failed dataset's numeric messages.
+            # Never send complete partitions/proposals or repeat aggregate violations.
+            # Keep every failed instance's numeric diagnostics and the whole source.
+            metric_keys = ('nest_count','total_proxy_flight_seconds','maximum_region_tasks',
+                           'minimum_endurance_margin_seconds','minimum_service_margin_km')
             feedback['parent_diagnostic'] = {
+                'status':parent['evaluation'].get('status'),
                 'objectives':parent.get('objectives'),
-                'datasets':[{k:r.get(k) for k in ('name','feasible','metrics','violations')}
-                            for r in parent['evaluation'].get('datasets',[])],
-                'violations':parent['evaluation'].get('violations',[]),
+                'datasets':[{'name':r['name'],'feasible':r['feasible'],
+                    'metrics':{k:r.get('metrics',{}).get(k) for k in metric_keys},
+                    'violations':list(dict.fromkeys(r.get('violations',[])))}
+                    for r in parent['evaluation'].get('datasets',[])],
             }
-            text = json.dumps(feedback,ensure_ascii=False)
+            if not parent['evaluation'].get('datasets'):
+                feedback['parent_diagnostic']['violations'] = parent['evaluation'].get('violations',[])
+        text = json.dumps(feedback,ensure_ascii=False,separators=(',',':'),default=str)
         source = (artifacts.root/parent['source_path']).read_text(encoding='utf-8') if parent else '无；从零生成。'
         return f'本轮方向必须为 {direction}。\n固定评测诊断：{text}\n父代完整源码：\n{source}'
 
@@ -336,7 +352,7 @@ class SearchController:
                     start = time.perf_counter()
                     try:
                         artifacts.log(f"{row['candidate_id']} LLM request start",event='llm_start')
-                        with artifacts.heartbeat(f"{row['candidate_id']} waiting for LLM",self.settings.heartbeat_seconds):
+                        with artifacts.heartbeat(f"{row['candidate_id']} LLM request active",self.settings.heartbeat_seconds):
                             generated = self.client.generate(system,self._prompt(parent,direction,artifacts),direction)
                         if redact_secrets(generated.algorithm_code,(self.llm.api_key,)) != generated.algorithm_code:
                             raise ValueError('Generated source contains sensitive-looking text; refusing unsafe checkpoint.')

@@ -18,7 +18,9 @@ nano "stage1+llm/config/deepseek.local.json"
 chmod 600 "stage1+llm/config/deepseek.local.json"
 ```
 
-Windows可以复制示例后用文本编辑器编辑。填写真实 `api_key` 及**账号当前可用的模型ID**；示例中的模型名称不代表已验证可用。本实现未调用真实API验收。密钥仅从这个JSON读取，不会从Git下载，不要放进命令行、截图或聊天。`base_url/model/temperature/timeout_seconds/retries/max_tokens` 沿用现有兼容接口设置。
+Windows可以复制示例后用文本编辑器编辑。填写真实 `api_key` 及**账号当前可用的模型ID**；示例中的模型名称不代表已验证可用。本实现未调用真实API验收。密钥仅从这个JSON读取，不会从Git下载，不要放进命令行、截图或聊天。不要用公开示例覆盖已有私密配置而丢失密钥。
+
+省token缺省设置：`thinking: "disabled"`、`reasoning_effort: null`、`max_tokens: 8192`、`retries: 1`、`stream: true`。显式关闭高耗token思考模式，保留完整代码，四项公开说明各不超过80字；父代反馈去掉完整分区及重复信息，仍保留失败实例的数值诊断。**这些措施不保证固定费用或算法质量**。原私密文件显式设置的额度仍生效，可用下方命令覆盖；无需修改密钥。
 
 ## 2. 先跑离线测试：不需要密钥，不收费
 
@@ -51,32 +53,32 @@ python -u "stage1+llm/run.py" prepare-data
 
 搜索输入会与87坐标核对，拒绝把87或包含它的189当搜索数据。保护检查不把87坐标或成绩发送给LLM。验证集参与选优，不能称为最终盲测集。
 
-## 4. 真实3轮试跑，再运行完整搜索
+## 4. 先真实1轮连通性试跑，再运行完整搜索
 
 以下命令会调用收费API，由你决定何时运行：
 
 ```bash
-python -u "stage1+llm/run.py" optimize --run-id trial-v3 --evaluation-budget 3 --no-improvement-limit 3
+python -u "stage1+llm/run.py" optimize --run-id trial-v3-stream --evaluation-budget 1 --thinking disabled --max-tokens 8192 --api-retries 1 --stream --show-code
 ```
 
 完整前台运行，逐轮直接显示在控制台：
 
 ```bash
-python -u "stage1+llm/run.py" optimize --run-id search-v3
+python -u "stage1+llm/run.py" optimize --run-id search-v3-stream --thinking disabled --max-tokens 8192 --api-retries 1 --stream --show-code
 ```
 
-默认3个独立初始候选、最多40轮、前沿连续10轮无改善停止。生成失败占1轮；每轮SDK重试可能增加实际HTTP请求。日志记录实际尝试数及最终响应可获得的token用量，**不是账单，也不保证覆盖所有重试的计费用量**。
+1轮仅用于验证“请求→正文→代码检查→17份数据评估”能否完成，不代表算法已经搜索充分。默认完整搜索3个独立初始候选、最多40轮、前沿连续10轮无改善停止。生成失败占1轮；每轮SDK重试可能增加实际HTTP请求。日志记录实际尝试数及最终响应可获得的token用量，**不是账单，也不保证覆盖所有重试的计费用量**。`--api-retries 0` 可禁用传输重试；不会因解析失败或断流自动重新付费生成。
 
 Linux后台单行命令，外层日志以日期命名：
 
 ```bash
-mkdir -p "stage1+llm/outputs/console" && nohup python -u "stage1+llm/run.py" optimize --run-id search-v3 > "stage1+llm/outputs/console/$(date +%Y%m%d_%H%M%S).log" 2>&1 < /dev/null &
+mkdir -p "stage1+llm/outputs/console" && nohup python -u "stage1+llm/run.py" optimize --run-id search-v3-stream --thinking disabled --max-tokens 8192 --api-retries 1 --stream --show-code > "stage1+llm/outputs/console/$(date +%Y%m%d_%H%M%S).log" 2>&1 < /dev/null &
 ```
 
 实时看每轮过程：
 
 ```bash
-tail -f "stage1+llm/outputs/search-v3/search.log"
+tail -F "stage1+llm/outputs/search-v3-stream/search.log"
 ```
 
 日志为UTC时间，示意（非实验成绩）：
@@ -84,8 +86,12 @@ tail -f "stage1+llm/outputs/search-v3/search.log"
 ```text
 [iteration_start] round=... parent=C.... direction=... reason=...
 [llm_start] C.... LLM request start
+[llm_request_config] C.... thinking=disabled effort=None max_tokens=8192 stream=True retries=1 prompt_chars=...
 [api_request] C.... Provider HTTP request attempt=...
-[heartbeat] C.... waiting for LLM; elapsed=...s
+[heartbeat] C.... LLM request active; elapsed=...s
+[llm_stream_start] C.... Provider stream connected; receiving response (not yet validated)
+[llm_text] C.... {"algorithm_idea":"...", ...
+[llm_text] C.... ...增量返回的公开JSON正文及源码...
 [llm_response] C.... finish_reason=... response_chars=... usage=... public_response=responses/C....json
 [llm_explanation] C.... algorithm_idea: ...
 [llm_code] C.... returned source BEGIN (not executed/validated yet)
@@ -100,23 +106,23 @@ tail -f "stage1+llm/outputs/search-v3/search.log"
 
 ### LLM返回内容可见性与JSON错误排查
 
-默认 `show_code: true`：返回成功后，在控制台和 `search.log` 打印四项公开说明（算法思路、修改假设、预期改善、修改摘要）及完整带行号源码。代码展示发生在约束评估前，**看到代码不代表代码已执行成功或已证明可行**。可加 `--no-show-code` 关闭源码展示；说明、响应诊断和源码文件仍保留。
+默认 `show_code: true` 且 `stream: true`：公开正文边生成边通过 `[llm_text]` 显示，完成后再打印四项说明（算法思路、修改假设、预期改善、修改摘要）及完整带行号源码。代码展示发生在约束评估前，**看到代码不代表代码已执行成功或已证明可行**。可加 `--no-show-code` 同时关闭原始正文和源码展示；四项说明、响应诊断和源码文件仍保留。`--no-stream` 则等完整响应后显示公开正文。
 
-这不是逐token流式输出：响应尚未完成时仍只有等待心跳；拿到完整响应后才展示。心跳不代表服务端生成进度。不会读取或输出模型的 `reasoning_content`，只处理公开的最终 `message.content`。
+为便于阅读和跨分块脱敏，公开正文合并成小段打印（约256字符，或有新分块到达且距上次显示已过1秒；密钥前缀会延迟到可安全脱敏时显示），并非每token打印一行。原始JSON中的代码换行可能显示为 `\n`，完成后的带行号源码会正常换行。首字到达之前只有心跳，心跳不是供应商的百分比进度，也无法展示服务端尚未返回的文字。只处理公开的 `delta.content`/`message.content`，不读取或输出内部推理字段。打印内容不增加API调用或模型token。
 
-每次收到响应，会在解析JSON前保存 `responses/C0001.json` 等诊断文件，包含脱敏后的公开正文、结束原因、响应ID、正文字符数和可获得的token用量。即使解析失败也保留；不保存整个供应商响应对象或内部推理字段。
+每次收到响应，会在解析JSON前保存 `responses/C0001.json` 等诊断文件，包含脱敏后的公开正文、结束原因、响应ID、正文字符数和可获得的token用量。流式中断时也保存已接收的公开正文，并标记 `stream_complete: false`；截断、断流、未收到结束标志或JSON错误均不得进入执行。过程中已显示片段保存在 `search.log` 与 `events.jsonl`；断电/强杀只能保留此前已落盘的片段。不保存整个供应商响应对象或内部推理字段。
 
 - `finish_reason=length`：响应被截断，拒绝执行；需要结合 `max_tokens`、上下文和token明细判断，不自动增大预算或重发。
 - 正文为空：明确报告 `empty final content`，而不是笼统JSON异常。
 - 非法JSON：显示行、列及字符数，在控制台展示公开正文前12000字符，完整正文仍在诊断文件。
 - 无choices、过滤或其他中断：分别报告，不冒充可部署候选。
 
-修改只改善观测与输入完整性检查，不自动修补或执行半截程序。旧版本未保存的失败响应无法事后恢复。此更新改变了实现哈希，旧搜索不能混用新实现续跑；先保留旧任务产物，新版本使用新run ID，例如 `trial-v3-log`。无需为了日志更新覆盖旧目录。
+这次仅修改调用预算、公开输出、提示词紧凑程度和完整性检查，不改变部署硬约束、三目标或进化评分。旧版本未保存的失败响应无法事后恢复。此更新改变了实现和提示词哈希，旧搜索不能混用新实现续跑；先保留旧任务产物，新版本使用新run ID，例如 `trial-v3-stream`。无需覆盖旧目录。
 
 ## 5. 看方案、手动选定、最后评估87
 
 ```bash
-python -u "stage1+llm/run.py" list-candidates --run-id search-v3
+python -u "stage1+llm/run.py" list-candidates --run-id search-v3-stream
 ```
 
 控制台显示候选编号、跨实例平均机巢数、平均总飞行时间（启发式）、最大区域任务数和三目标。逐数据集原始指标在 `evaluations/*.json`，不要把跨实例平均数当成87成绩。
@@ -124,15 +130,15 @@ python -u "stage1+llm/run.py" list-candidates --run-id search-v3
 例如看完表后选C0007（**请替换成真实存在且仍在前沿的编号**）：
 
 ```bash
-python -u "stage1+llm/run.py" export-best --run-id search-v3 --candidate-id C0007 --reason "根据机巢成本和最大区域规模选择"
+python -u "stage1+llm/run.py" export-best --run-id search-v3-stream --candidate-id C0007 --reason "根据机巢成本和最大区域规模选择"
 ```
 
-输出 `outputs/search-v3/selected/C0007/algorithm.py`、选择记录及已评估的指标。没有默认的 `best_algorithm.py`，也没有隐含加权选模。
+输出 `outputs/search-v3-stream/selected/C0007/algorithm.py`、选择记录及已评估的指标。没有默认的 `best_algorithm.py`，也没有隐含加权选模。
 
 固定选择后评估87，不回写搜索奖励：
 
 ```bash
-python -u "stage1+llm/run.py" evaluate --candidate "stage1+llm/outputs/search-v3/selected/C0007/algorithm.py" --input turbine87.tsv --run-id test87-C0007
+python -u "stage1+llm/run.py" evaluate --candidate "stage1+llm/outputs/search-v3-stream/selected/C0007/algorithm.py" --input turbine87.tsv --run-id test87-C0007
 ```
 
 可行时输出：
@@ -149,13 +155,13 @@ python -u "stage1+llm/run.py" evaluate --candidate "stage1+llm/outputs/search-v3
 ## 6. 恢复规则
 
 ```bash
-python -u "stage1+llm/run.py" resume --resume-run-id search-v3
+python -u "stage1+llm/run.py" resume --resume-run-id search-v3-stream --thinking disabled --max-tokens 8192 --api-retries 1 --stream --show-code
 ```
 
 增加预算（只能增大，其他实验身份保持不变）：
 
 ```bash
-python -u "stage1+llm/run.py" resume --resume-run-id search-v3 --evaluation-budget 60 --reset-stall
+python -u "stage1+llm/run.py" resume --resume-run-id search-v3-stream --evaluation-budget 60 --reset-stall --thinking disabled --max-tokens 8192 --api-retries 1 --stream --show-code
 ```
 
 若3轮试跑覆盖了 `--no-improvement-limit 3`，恢复也须带同值；正式默认是10。恢复核对数据哈希、物理约束、目标、模型配置、提示词及实现哈希，拒绝不同实验混用。数据内容相同而目录搬迁不影响逻辑身份；源文件的字节哈希变化仍会被拒绝。

@@ -40,7 +40,13 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument('--no-improvement-limit',type=int)
         command.add_argument('--heartbeat-seconds',type=float)
         command.add_argument('--show-code',action=argparse.BooleanOptionalAction,default=None,
-                             help='Print returned full algorithm source (default enabled); does not stream tokens.')
+                             help='Show live public response and formatted source (default enabled).')
+        command.add_argument('--thinking',choices=('disabled','enabled'),default=None)
+        command.add_argument('--reasoning-effort',choices=('low','high','max'),default=None)
+        command.add_argument('--max-tokens',type=int,default=None)
+        command.add_argument('--api-retries',type=int,default=None)
+        command.add_argument('--stream',action=argparse.BooleanOptionalAction,default=None,
+                             help='Stream public response text (default enabled).')
     sub.choices['resume'].add_argument('--resume-run-id',type=validate_run_id,required=True)
     sub.choices['resume'].add_argument('--reset-stall',action='store_true')
     evaluate = sub.choices['evaluate']
@@ -83,6 +89,13 @@ def main(argv: list[str] | None = None) -> int:
                        if getattr(args,key) is not None}
             settings = replace(settings,**changes)
             llm = load_deepseek_settings(args.deepseek_config)
+            llm_changes = {key:getattr(args,key) for key in ('thinking','reasoning_effort','max_tokens','stream')
+                           if getattr(args,key) is not None}
+            if args.api_retries is not None:
+                llm_changes['retries'] = args.api_retries
+            if args.thinking == 'disabled':
+                llm_changes['reasoning_effort'] = None
+            llm = replace(llm,**llm_changes)
             controller = SearchController(settings,llm,args.outputs)
             try:
                 controller.run(args.resume_run_id if args.command == 'resume' else args.run_id,

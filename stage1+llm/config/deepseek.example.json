@@ -4,6 +4,9 @@
   "api_key": "PUT_YOUR_KEY_IN_deepseek.local.json",
   "temperature": 0.2,
   "timeout_seconds": 180,
-  "retries": 3,
-  "max_tokens": 10000
+  "retries": 1,
+  "max_tokens": 8192,
+  "thinking": "disabled",
+  "reasoning_effort": null,
+  "stream": true
 }

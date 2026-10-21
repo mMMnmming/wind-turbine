@@ -29,7 +29,7 @@ def public_json(direction='structural_exploration'):
 
 def stub_client(response):
     client = DeepSeekClient.__new__(DeepSeekClient)
-    client.settings = DeepSeekSettings('https://example.invalid','mock','private-key-value')
+    client.settings = DeepSeekSettings('https://example.invalid','mock','private-key-value',stream=False)
     client.observer = None
     client.client = types.SimpleNamespace(chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=lambda **kw:response)))
     return client
@@ -45,7 +45,7 @@ class ResponseDiagnosticsTests(unittest.TestCase):
         self.assertEqual(client.last_response['usage']['total_tokens'],130)
         self.assertIn('公开算法思路',client.last_response['content'])
         self.assertNotIn('PRIVATE_REASONING',json.dumps(client.last_response))
-        self.assertEqual(events[0][1]['kind'],'llm_response')
+        self.assertTrue(any(fields.get('kind') == 'llm_response' for _,fields in events))
 
     def test_empty_length_and_invalid_json_are_distinct(self):
         for content,reason,expected in [('', 'stop','empty'),('{"algorithm_code":', 'length','truncated'),

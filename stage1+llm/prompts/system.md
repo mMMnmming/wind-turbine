@@ -13,4 +13,4 @@
 
 方向：constraint_repair修复覆盖/归属；reduce_nests探索减少机巢的折中；rebalance_assignments移动/交换边界任务并平衡分区；increase_safety_margin修复半径/续航；reduce_route_distance降低有向飞行时间；structural_exploration探索不同完整算法；simplify_tune简化并调整内部常量。可探索移巢、迁移、交换、合并后重分配、拆分或破坏后修复，但不得改变物理参数。
 
-必须只返回JSON对象，字段恰好为 algorithm_code、algorithm_idea、change_hypothesis、expected_improvement、change_summary、direction_id。direction_id严格使用用户本轮指定值；其他说明使用简短中文。描述可检查的算法机制、修改假设和预期，不输出隐藏推理过程。不要输出Markdown或仅提供补丁。
+必须只返回JSON对象，字段恰好为 algorithm_idea、change_hypothesis、expected_improvement、change_summary、direction_id、algorithm_code。先写说明，最后写完整源码，方便流式阅读。direction_id严格使用用户本轮指定值；四项说明各不超过80字。源码保持紧凑，避免重复代码、长注释、示例数据和测试代码，但不得省略完整函数及必要的硬约束处理。描述可检查的算法机制、修改假设和预期，不输出隐藏推理过程。不要输出Markdown或仅提供补丁。

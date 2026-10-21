@@ -245,7 +245,7 @@ class ClientTests(unittest.TestCase):
                                              usage=types.SimpleNamespace(model_dump=lambda:{'total_tokens':123}))
         modules = {'openai':types.SimpleNamespace(OpenAI=SDK),'httpx':types.SimpleNamespace(Client=HttpClient)}
         with patch.dict(sys.modules,modules):
-            client = DeepSeekClient(DeepSeekSettings('https://example.invalid','mock','private-key'))
+            client = DeepSeekClient(DeepSeekSettings('https://example.invalid','mock','private-key',stream=False))
             seen = []
             client.set_observer(lambda message,**kwargs:seen.append(kwargs))
             client.generate('system','prompt','reduce_nests')

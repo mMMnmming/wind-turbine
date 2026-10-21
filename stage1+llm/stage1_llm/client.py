@@ -5,6 +5,7 @@ import time
 from typing import Callable
 from dataclasses import dataclass
 from .candidate import ModelCandidate
+from .artifacts import redact_secrets
 
 @dataclass(frozen=True)
 class DeepSeekSettings:
@@ -13,8 +14,11 @@ class DeepSeekSettings:
     api_key: str
     temperature: float = 0.2
     timeout_seconds: int = 180
-    retries: int = 3
-    max_tokens: int = 10000
+    retries: int = 1
+    max_tokens: int = 8192
+    thinking: str = 'disabled'
+    reasoning_effort: str | None = None
+    stream: bool = True
 
     def __post_init__(self):
         if not self.base_url.startswith(("https://", "http://")) or not self.model.strip():
@@ -23,6 +27,43 @@ class DeepSeekSettings:
             raise ValueError("api_key must be a string in the private JSON config.")
         if not 0 <= self.temperature <= 2 or self.timeout_seconds < 1 or self.retries < 0 or self.max_tokens < 1:
             raise ValueError("Invalid DeepSeek temperature, timeout, retries, or max_tokens.")
+        if type(self.max_tokens) is not int or self.max_tokens > 393216:
+            raise ValueError('max_tokens must be an integer between 1 and 393216.')
+        if type(self.retries) is not int or type(self.stream) is not bool:
+            raise ValueError('retries must be an integer and stream must be a boolean.')
+        if self.thinking not in ('enabled','disabled'):
+            raise ValueError('thinking must be enabled or disabled.')
+        if self.reasoning_effort not in (None,'low','high','max'):
+            raise ValueError('reasoning_effort must be null, low, high or max.')
+        if self.thinking == 'disabled' and self.reasoning_effort is not None:
+            raise ValueError('reasoning_effort requires thinking=enabled; do not send conflicting controls.')
+
+
+class _PublicTextBuffer:
+    """Coalesce public deltas and redact secrets even when split across chunks."""
+
+    def __init__(self, emit: Callable, secret: str):
+        self.emit = emit
+        self.secret = secret
+        self.pending = ''
+        self.last_emit = time.perf_counter()
+
+    def feed(self, text: str = '', *, final: bool = False) -> None:
+        self.pending += text
+        # Hold enough suffix to recognize a key whose next chunk has not arrived.
+        cut = len(self.pending) if final else max(0,len(self.pending)-max(2,len(self.secret)-1))
+        if not final:
+            spans = [(m.start(),m.end()) for m in re.finditer(r'sk-[A-Za-z0-9_-]*',self.pending)]
+            if self.secret:
+                spans.extend((m.start(),m.end()) for m in re.finditer(re.escape(self.secret),self.pending))
+            for start,end in sorted(spans,reverse=True):
+                if start < cut < end or (end == len(self.pending) and start < cut):
+                    cut = start
+        if cut and (final or cut >= 256 or time.perf_counter()-self.last_emit >= 1.0):
+            visible = redact_secrets(self.pending[:cut],(self.secret,))
+            self.pending = self.pending[cut:]
+            self.emit(visible)
+            self.last_emit = time.perf_counter()
 
 REQUIRED_RESPONSE_FIELDS = {"algorithm_code", "algorithm_idea", "change_hypothesis", "expected_improvement", "change_summary", "direction_id"}
 
@@ -70,32 +111,97 @@ class DeepSeekClient:
     def close(self) -> None:
         self.client.close()
 
+    def _record_response(self, content: str, reason: str | None, response_id: str | None,
+                         model: str, usage: dict | None, choice_count: int, **fields) -> None:
+        self.last_metadata.update(usage=usage,finish_reason=reason,response_id=response_id,
+                                  response_chars=len(content),choice_count=choice_count,**fields)
+        # Whitelist public text. Never serialize a whole SDK message/delta object.
+        self.last_response = {**self.last_metadata,'model':model,'content':content}
+        if self.observer:
+            self.observer('Public LLM response received',kind='llm_response',**self.last_response)
+
+    def _read_stream(self, stream) -> tuple[str, str | None, int]:
+        pieces = []
+        reason, response_id, usage = None, None, None
+        model, choice_count, complete = self.settings.model, 0, False
+        stream_error = None
+        def emit(text: str) -> None:
+            if self.observer:
+                self.observer('Public response text',kind='llm_text',text=text)
+        display = _PublicTextBuffer(emit,self.settings.api_key)
+        try:
+            for index,chunk in enumerate(stream):
+                if index == 0 and self.observer:
+                    self.observer('Provider stream connected; receiving response (not yet validated)',
+                                  kind='llm_stream_start')
+                response_id = getattr(chunk,'id',None) or response_id
+                model = getattr(chunk,'model',None) or model
+                chunk_usage = getattr(chunk,'usage',None)
+                if chunk_usage is not None:
+                    usage = chunk_usage.model_dump()
+                choices = getattr(chunk,'choices',None) or []
+                choice_count = max(choice_count,len(choices))
+                for choice in choices:
+                    if getattr(choice,'index',0) != 0:
+                        raise ValueError('Unexpected multiple stream choices; refusing ambiguous candidate.')
+                    text = getattr(getattr(choice,'delta',None),'content',None) or ''
+                    if text:
+                        if reason is not None:
+                            raise ValueError('Public text arrived after stream finish_reason.')
+                        pieces.append(text)
+                        display.feed(text)
+                    reason = getattr(choice,'finish_reason',None) or reason
+            complete = reason is not None
+        except BaseException as error:
+            # A lost/interrupted stream is never silently replayed or accepted.
+            stream_error = type(error).__name__
+            raise
+        finally:
+            try:
+                display.feed(final=True)
+                self._record_response(''.join(pieces),reason,response_id,model,usage,choice_count,
+                    stream_complete=complete,stream_error=stream_error)
+            finally:
+                stream.close()
+        return ''.join(pieces),reason,choice_count
+
     def generate(self, system_prompt: str, user_prompt: str, expected_direction: str | None = None) -> ModelCandidate:
         self.actual_requests = 0
         start = time.perf_counter()
         self.last_metadata = {}
         self.last_response = {}
         try:
-            response = self.client.chat.completions.create(model=self.settings.model, temperature=self.settings.temperature,
-                max_tokens=self.settings.max_tokens, response_format={"type":"json_object"},
+            request = dict(model=self.settings.model,max_tokens=self.settings.max_tokens,
+                response_format={"type":"json_object"},stream=self.settings.stream,
+                extra_body={'thinking':{'type':self.settings.thinking}},
                 messages=[{"role":"system","content":system_prompt},{"role":"user","content":user_prompt}])
-            usage = getattr(response,'usage',None)
-            self.last_metadata['usage'] = usage.model_dump() if usage is not None else None
-            choices = getattr(response,'choices',None) or []
-            choice = choices[0] if choices else None
-            content = getattr(getattr(choice,'message',None),'content',None) or ''
-            reason = getattr(choice,'finish_reason',None)
-            self.last_metadata.update(finish_reason=reason,response_id=getattr(response,'id',None),
-                                      response_chars=len(content),choice_count=len(choices))
-            # Whitelist public final content and metadata. Never dump the whole
-            # response/message object: it may contain private reasoning fields.
-            self.last_response = {**self.last_metadata,'model':getattr(response,'model',self.settings.model),
-                                  'content':content}
+            if self.settings.thinking == 'disabled':
+                request['temperature'] = self.settings.temperature
+            elif self.settings.reasoning_effort is not None:
+                request['reasoning_effort'] = self.settings.reasoning_effort
+            if self.settings.stream:
+                request['stream_options'] = {'include_usage':True}
             if self.observer:
-                self.observer('Public LLM response received',kind='llm_response',**self.last_response)
+                self.observer(f'thinking={self.settings.thinking} effort={self.settings.reasoning_effort} '
+                    f'max_tokens={self.settings.max_tokens} stream={self.settings.stream} retries={self.settings.retries} '
+                    f'prompt_chars={len(system_prompt)+len(user_prompt)}',kind='llm_request_config')
+            response = self.client.chat.completions.create(**request)
+            if self.settings.stream:
+                content,reason,choice_count = self._read_stream(response)
+            else:
+                usage = getattr(response,'usage',None)
+                choices = getattr(response,'choices',None) or []
+                choice = choices[0] if choices else None
+                content = getattr(getattr(choice,'message',None),'content',None) or ''
+                reason = getattr(choice,'finish_reason',None)
+                choice_count = len(choices)
+                self._record_response(content,reason,getattr(response,'id',None),
+                    getattr(response,'model',self.settings.model),usage.model_dump() if usage else None,choice_count)
             try:
-                if not choices:
+                if not choice_count:
                     raise ValueError('DeepSeek response has no choices; inspect response diagnostics.')
+                if self.settings.stream and reason is None:
+                    raise ValueError('DeepSeek stream ended without finish_reason; refusing partial content.')
                 if reason == 'length':
                     raise ValueError('DeepSeek response truncated (finish_reason=length); inspect max_tokens/context and usage.')
                 if reason not in (None,'stop'):

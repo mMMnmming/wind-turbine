@@ -97,6 +97,6 @@ def load_search_settings(path: Path, validation_overrides: list[str] | None = No
 
 def load_deepseek_settings(path: Path) -> DeepSeekSettings:
     raw = _load_json(path)
-    allowed = {"base_url", "model", "api_key", "temperature", "timeout_seconds", "retries", "max_tokens"}
+    allowed = set(DeepSeekSettings.__dataclass_fields__)
     if set(raw) - allowed: raise ValueError(f"Unknown DeepSeek config keys: {sorted(set(raw)-allowed)}")
     return DeepSeekSettings(**raw)
