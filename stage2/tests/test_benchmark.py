@@ -73,12 +73,24 @@ class BenchmarkTests(unittest.TestCase):
         report = reference_summary([(self.instance, reference["flight_seconds"] * 1.1, True)], {key: reference})
         self.assertAlmostEqual(report["mean_optimality_gap"], 0.1)
         self.assertEqual(report["optimality_gap_count"], 1.0)
+        self.assertAlmostEqual(report["weighted_optimality_gap"], 0.1)
         excluded = reference_summary([(self.instance, 1.0, False)], {key: reference})
         self.assertEqual(excluded["optimality_gap_count"], 0.0)
         self.assertNotIn("mean_optimality_gap", excluded)
         reference["proven_optimal"] = False
         unproven = reference_summary([(self.instance, 1.0, True)], {key: reference})
         self.assertNotIn("mean_optimality_gap", unproven)
+
+    def test_weighted_gap_uses_sum_not_mean_of_percentages(self) -> None:
+        first = small_instance("first", 0, nodes=3)
+        second = small_instance("second", 10, nodes=4)
+        references = {
+            instance_fingerprint(first): {"flight_seconds": 100., "feasible": True, "proven_optimal": True},
+            instance_fingerprint(second): {"flight_seconds": 900., "feasible": True, "proven_optimal": True},
+        }
+        result = reference_summary([(first, 110., True), (second, 900., True)], references)
+        self.assertAlmostEqual(result["mean_optimality_gap"], .05)
+        self.assertAlmostEqual(result["weighted_optimality_gap"], .01)
 
     def test_subset_selection_covers_node_sizes_deterministically(self) -> None:
         instances = [small_instance(str(index), float(index), nodes=3 + index) for index in range(8)]

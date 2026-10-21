@@ -23,6 +23,7 @@ from .data import (
     split_fingerprint,
 )
 from .pool import TrainingPool, assert_disjoint, source_hashes
+from .atsp import WindATSPInstance
 
 
 ROOT = Path(__file__).resolve().parent
@@ -90,7 +91,7 @@ def _write_data_manifest(
 def _prepare_or_load_dataset(
     directory: Path, input_path: Path, config_path: Path, seed: int,
     virtual_fields: int, validation_fields: int, gust_speed_mps: float, max_attempts: int,
-) -> tuple[list[object], list[object], dict[str, object]]:
+) -> tuple[list[WindATSPInstance], list[WindATSPInstance], dict[str, object]]:
     """Prepare once or verify a portable immutable dataset before reuse."""
     settings = {
         "seed": seed, "virtual_fields": virtual_fields, "validation_fields": validation_fields,
@@ -284,7 +285,7 @@ def _run_search(
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description="Train or evaluate the wind-aware pointer network.")
-    parser.add_argument("mode", choices=("prepare_data", "train", "resume", "search", "evaluate"))
+    parser.add_argument("mode", choices=("prepare_data", "train", "resume", "search", "evaluate", "finetune_compare"))
     parser.add_argument("--input", type=Path, help="Defaults to turbine102.tsv for training and turbine87.tsv for evaluation.")
     parser.add_argument("--stage1-config", type=Path, default=ROOT.parent / "stage1" / "config.json")
     parser.add_argument("--regions-json", type=Path, help="Existing Stage-1 region JSON, for evaluation.")
@@ -317,9 +318,18 @@ def main() -> int:
     parser.add_argument("--decode-chunk-size", type=int)
     parser.add_argument("--lr-min", type=float)
     parser.add_argument("--lr-schedule-epochs", type=int)
+    parser.add_argument("--entropy-start", type=float, default=0.01, help="Fine-tune entropy arm initial coefficient.")
+    parser.add_argument("--entropy-end", type=float, default=0.0)
+    parser.add_argument("--resume", action="store_true", help="Resume an existing paired fine-tuning experiment.")
     parser.add_argument("--plot-dpi", type=int, default=300)
     args = parser.parse_args()
     args.input = _resolve_input_path(args.mode, args.input)
+
+    if args.mode == "finetune_compare":
+        from .finetune import comparison_from_cli
+        return comparison_from_cli(args, parser)
+    if args.resume:
+        parser.error("--resume is for finetune_compare; ordinary training uses the resume mode.")
 
     saved_config = json.loads(args.config.read_text(encoding="utf-8"))
     for name in ("device", "seed", "data_seed", "epochs", "batch_size", "batches_per_epoch", "virtual_fields",

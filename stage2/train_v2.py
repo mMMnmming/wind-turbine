@@ -36,7 +36,7 @@ def evaluate_edge_policy(model: torch.nn.Module, instances: list[WindATSPInstanc
     if not instances:
         raise ValueError("Validation requires at least one independent routing instance.")
     main, greedy, normalized_energy, rewards, nn_improvements, candidates, diversity = [], [], [], [], [], [], []
-    predictions, buckets = [], {}
+    predictions, greedy_predictions, buckets = [], [], {}
     for instance in instances:
         selected = infer_instance(model, instance, device, config.decode_strategy,
                                   config.decode_samples, config.decode_chunk_size, config.evaluation_seed)
@@ -55,6 +55,7 @@ def evaluate_edge_policy(model: torch.nn.Module, instances: list[WindATSPInstanc
         candidates.append(selected["feasible_candidate_count"] / selected["candidate_count"])
         diversity.append(selected["unique_route_fraction"])
         predictions.append((instance, result.flight_seconds, result.feasible))
+        greedy_predictions.append((instance, single.flight_seconds, single.feasible))
         bucket = (max(instance.node_count - 2, 0)) // 10
         buckets.setdefault(bucket, []).append(main[-1])
     values = np.asarray(main)
@@ -77,6 +78,7 @@ def evaluate_edge_policy(model: torch.nn.Module, instances: list[WindATSPInstanc
     if references is not None:
         from .benchmark import reference_summary
         report.update(reference_summary(predictions, references))
+        report["greedy"].update(reference_summary(greedy_predictions, references))
     return report
 
 

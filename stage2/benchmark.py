@@ -147,6 +147,7 @@ def reference_summary(
 ) -> dict[str, float]:
     """Report true-optimum gaps separately from best-known reference gaps."""
     optimal_gaps, known_gaps = [], []
+    optimal_model_total, optimal_reference_total = 0.0, 0.0
     matched = 0
     for instance, flight, feasible in predictions:
         record = references.get(instance_fingerprint(instance))
@@ -161,12 +162,17 @@ def reference_summary(
             if gap < -1e-5:
                 raise ValueError("A model route beats a claimed optimum; check the reference model/environment.")
             optimal_gaps.append(max(0.0, gap))
+            optimal_model_total += flight
+            optimal_reference_total += objective
         else:
             known_gaps.append(gap)
     result = {"reference_matched_count": float(matched), "optimality_gap_count": float(len(optimal_gaps)),
               "best_known_gap_count": float(len(known_gaps))}
     if optimal_gaps:
         result["mean_optimality_gap"] = mean(optimal_gaps)
+        result["weighted_optimality_gap"] = (optimal_model_total - optimal_reference_total) / optimal_reference_total
+        result["valid_model_flight_seconds"] = optimal_model_total
+        result["valid_reference_flight_seconds"] = optimal_reference_total
     if known_gaps:
         result["mean_best_known_gap"] = mean(known_gaps)
     return result
