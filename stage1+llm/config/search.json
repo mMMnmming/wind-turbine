@@ -8,6 +8,7 @@
   "data_seed": 1234,
   "validation_seed": 1001234,
   "heartbeat_seconds": 10.0,
+  "show_code": true,
   "deployment": {
     "communication_radius_km": 7.0,
     "max_horizontal_speed_mps": 23.0,

@@ -41,6 +41,7 @@ class SearchSettings:
     data_seed: int = 1234
     validation_seed: int = 1001234
     heartbeat_seconds: float = 10.0
+    show_code: bool = True
 
     def __post_init__(self) -> None:
         counts = (self.archive_size, self.initial_candidates, self.evaluation_budget,
@@ -53,6 +54,8 @@ class SearchSettings:
         import math
         if not math.isfinite(self.heartbeat_seconds) or self.heartbeat_seconds <= 0:
             raise ValueError('heartbeat_seconds must be finite and positive.')
+        if type(self.show_code) is not bool:
+            raise ValueError('show_code must be a boolean.')
         if not 0 < self.ucb_decay <= 1 or not math.isfinite(self.ucb_exploration) or self.ucb_exploration < 0:
             raise ValueError('Invalid UCB configuration.')
 

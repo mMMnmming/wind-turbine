@@ -33,7 +33,8 @@ def parse_model_response(content: str, expected_direction: str | None = None) ->
     try:
         data = json.loads(content)
     except json.JSONDecodeError as error:
-        raise ValueError("DeepSeek response must be one JSON object.") from error
+        raise ValueError(f'DeepSeek response must be one JSON object '
+                         f'(line {error.lineno}, column {error.colno}, chars={len(content)}).') from error
     if not isinstance(data, dict) or set(data) != REQUIRED_RESPONSE_FIELDS:
         raise ValueError("DeepSeek response must contain exactly the required provenance fields.")
     if not all(isinstance(data[key], str) and data[key].strip() for key in REQUIRED_RESPONSE_FIELDS):
@@ -51,6 +52,7 @@ class DeepSeekClient:
         self.observer = None
         self.actual_requests = 0
         self.last_metadata: dict = {}
+        self.last_response: dict = {}
         http_client = httpx.Client(event_hooks={'request':[self._on_request]})
         self.client = OpenAI(api_key=settings.api_key, base_url=settings.base_url, timeout=settings.timeout_seconds,
                              max_retries=settings.retries,http_client=http_client)
@@ -72,13 +74,39 @@ class DeepSeekClient:
         self.actual_requests = 0
         start = time.perf_counter()
         self.last_metadata = {}
+        self.last_response = {}
         try:
             response = self.client.chat.completions.create(model=self.settings.model, temperature=self.settings.temperature,
                 max_tokens=self.settings.max_tokens, response_format={"type":"json_object"},
                 messages=[{"role":"system","content":system_prompt},{"role":"user","content":user_prompt}])
             usage = getattr(response,'usage',None)
             self.last_metadata['usage'] = usage.model_dump() if usage is not None else None
-            return parse_model_response(response.choices[0].message.content or "", expected_direction)
+            choices = getattr(response,'choices',None) or []
+            choice = choices[0] if choices else None
+            content = getattr(getattr(choice,'message',None),'content',None) or ''
+            reason = getattr(choice,'finish_reason',None)
+            self.last_metadata.update(finish_reason=reason,response_id=getattr(response,'id',None),
+                                      response_chars=len(content),choice_count=len(choices))
+            # Whitelist public final content and metadata. Never dump the whole
+            # response/message object: it may contain private reasoning fields.
+            self.last_response = {**self.last_metadata,'model':getattr(response,'model',self.settings.model),
+                                  'content':content}
+            if self.observer:
+                self.observer('Public LLM response received',kind='llm_response',**self.last_response)
+            try:
+                if not choices:
+                    raise ValueError('DeepSeek response has no choices; inspect response diagnostics.')
+                if reason == 'length':
+                    raise ValueError('DeepSeek response truncated (finish_reason=length); inspect max_tokens/context and usage.')
+                if reason not in (None,'stop'):
+                    raise ValueError(f'DeepSeek response incomplete (finish_reason={reason}); refusing candidate.')
+                if not content.strip():
+                    raise ValueError('DeepSeek returned empty final content; inspect finish_reason and usage.')
+                return parse_model_response(content, expected_direction)
+            except ValueError as error:
+                if self.observer:
+                    self.observer(str(error),kind='llm_response_invalid')
+                raise
         finally:
             self.last_metadata.update(actual_requests=self.actual_requests,
                 sdk_retries=max(0,self.actual_requests-1),elapsed_seconds=time.perf_counter()-start,

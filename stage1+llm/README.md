@@ -86,6 +86,10 @@ tail -f "stage1+llm/outputs/search-v3/search.log"
 [llm_start] C.... LLM request start
 [api_request] C.... Provider HTTP request attempt=...
 [heartbeat] C.... waiting for LLM; elapsed=...s
+[llm_response] C.... finish_reason=... response_chars=... usage=... public_response=responses/C....json
+[llm_explanation] C.... algorithm_idea: ...
+[llm_code] C.... returned source BEGIN (not executed/validated yet)
+[llm_code] 0001 | def solve(turbines, config, seed):
 [dataset_start] C.... dataset=... nodes=102 start
 [dataset_end] ... feasible=... nests=... proxy_flight=... max_tasks=... algorithm=... evaluator=...
 [iteration_end] ... reward=... decision=... objectives=... delta=... front=... stalled=...
@@ -93,6 +97,21 @@ tail -f "stage1+llm/outputs/search-v3/search.log"
 ```
 
 等待API及运行算法/评估器时每10秒心跳；`--heartbeat-seconds` 可覆盖。方向分解保存在结构化事件和逐轮记录。日志、控制台和事件都做密钥脱敏；不输出隐藏推理过程。
+
+### LLM返回内容可见性与JSON错误排查
+
+默认 `show_code: true`：返回成功后，在控制台和 `search.log` 打印四项公开说明（算法思路、修改假设、预期改善、修改摘要）及完整带行号源码。代码展示发生在约束评估前，**看到代码不代表代码已执行成功或已证明可行**。可加 `--no-show-code` 关闭源码展示；说明、响应诊断和源码文件仍保留。
+
+这不是逐token流式输出：响应尚未完成时仍只有等待心跳；拿到完整响应后才展示。心跳不代表服务端生成进度。不会读取或输出模型的 `reasoning_content`，只处理公开的最终 `message.content`。
+
+每次收到响应，会在解析JSON前保存 `responses/C0001.json` 等诊断文件，包含脱敏后的公开正文、结束原因、响应ID、正文字符数和可获得的token用量。即使解析失败也保留；不保存整个供应商响应对象或内部推理字段。
+
+- `finish_reason=length`：响应被截断，拒绝执行；需要结合 `max_tokens`、上下文和token明细判断，不自动增大预算或重发。
+- 正文为空：明确报告 `empty final content`，而不是笼统JSON异常。
+- 非法JSON：显示行、列及字符数，在控制台展示公开正文前12000字符，完整正文仍在诊断文件。
+- 无choices、过滤或其他中断：分别报告，不冒充可部署候选。
+
+修改只改善观测与输入完整性检查，不自动修补或执行半截程序。旧版本未保存的失败响应无法事后恢复。此更新改变了实现哈希，旧搜索不能混用新实现续跑；先保留旧任务产物，新版本使用新run ID，例如 `trial-v3-log`。无需为了日志更新覆盖旧目录。
 
 ## 5. 看方案、手动选定、最后评估87
 

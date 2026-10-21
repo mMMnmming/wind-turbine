@@ -4,6 +4,7 @@ import hashlib, json, re
 import os
 import threading
 import time
+import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,6 +39,12 @@ def redact_secrets(value: Any, secrets: tuple[str, ...] = ()) -> Any:
         return value
     return value
 
+
+def terminal_text(value: str) -> str:
+    """Render untrusted control characters visibly rather than applying them."""
+    return ''.join(ch if ch in '\n\t' or unicodedata.category(ch) not in ('Cc','Cf')
+                   else ch.encode('unicode_escape').decode('ascii') for ch in value)
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -58,9 +65,9 @@ class RunArtifacts:
     def write_text(self, relative: str, value: str) -> None:
         atomic_text(safe_child(self.root,relative),value)
     def log(self, message: str, filename: str = "search.log", *, event: str = 'message', **fields: Any) -> None:
-        safe = str(redact_secrets(message, self.secrets))
+        safe = terminal_text(str(redact_secrets(message, self.secrets)))
         timestamp = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
-        line = f'{timestamp} [{event}] {safe}'
+        line = '\n'.join(f'{timestamp} [{event}] {part}' for part in safe.split('\n'))
         record = redact_secrets({'timestamp':timestamp, 'event':event, 'message':safe, **fields},self.secrets)
         with self._lock:
             with (self.root/filename).open('a',encoding='utf-8') as handle:

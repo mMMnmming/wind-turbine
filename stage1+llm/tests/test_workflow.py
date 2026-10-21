@@ -252,7 +252,7 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(client.last_metadata['actual_requests'],2)
             self.assertEqual(client.last_metadata['sdk_retries'],1)
             self.assertEqual(client.last_metadata['usage']['total_tokens'],123)
-            self.assertEqual(len(seen),2)
+            self.assertEqual(len([row for row in seen if 'actual_attempt' in row]),2)
             with patch.object(created[0],'create',side_effect=ValueError('provider failure')):
                 with self.assertRaises(ValueError):
                     client.generate('system','prompt','reduce_nests')

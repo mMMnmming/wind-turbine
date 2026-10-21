@@ -39,6 +39,8 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument('--evaluation-budget',type=int)
         command.add_argument('--no-improvement-limit',type=int)
         command.add_argument('--heartbeat-seconds',type=float)
+        command.add_argument('--show-code',action=argparse.BooleanOptionalAction,default=None,
+                             help='Print returned full algorithm source (default enabled); does not stream tokens.')
     sub.choices['resume'].add_argument('--resume-run-id',type=validate_run_id,required=True)
     sub.choices['resume'].add_argument('--reset-stall',action='store_true')
     evaluate = sub.choices['evaluate']
@@ -77,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Frozen datasets={len(bundle['datasets'])} fingerprint={bundle['fingerprint']} path={settings.data_dir}",flush=True)
             return 0
         if args.command in ('optimize','resume'):
-            changes = {key:getattr(args,key) for key in ('evaluation_budget','no_improvement_limit','heartbeat_seconds')
+            changes = {key:getattr(args,key) for key in ('evaluation_budget','no_improvement_limit','heartbeat_seconds','show_code')
                        if getattr(args,key) is not None}
             settings = replace(settings,**changes)
             llm = load_deepseek_settings(args.deepseek_config)

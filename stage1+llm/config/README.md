@@ -17,10 +17,11 @@
 | seed | 1234，父代及方向选择种子，不保证远端LLM逐字可复现 |
 | candidate_timeout_seconds | 300，单候选单数据集的子进程墙钟超时 |
 | heartbeat_seconds | 10，LLM等待、算法和可信评估心跳间隔 |
+| show_code | true，返回后打印完整带行号源码；`--no-show-code`关闭，不影响搜索评分 |
 | ucb_decay / ucb_exploration | 0.9 / 0.7，历史方向评分衰减及探索强度 |
 | lower_bound_nests | 1，仅保留旧配置兼容；不据此声明多目标全局最优 |
 | direction_actions / diagnostic_direction_map | 方向说明及诊断映射；覆盖、归属、半径、续航修复 |
 
-数据集冻结与物理配置分开记录；同一manifest可用于新物理实验，但不可在旧run中改变物理配置后继续搜索。恢复仅允许增大 `evaluation_budget`、通过 `--reset-stall` 重置停滞、修改日志心跳显示。其他设置改变必须新run；数据/种子改变还必须使用新data_dir。
+数据集冻结与物理配置分开记录；同一manifest可用于新物理实验，但不可在旧run中改变物理配置后继续搜索。恢复仅允许增大 `evaluation_budget`、通过 `--reset-stall` 重置停滞、修改日志心跳和源码显示。其他设置改变必须新run；数据/种子改变还必须使用新data_dir。
 
 `deepseek.local.json` 字段沿用 `base_url/model/api_key/temperature/timeout_seconds/retries/max_tokens`。请求尝试及SDK重试由传输钩子记录；响应token用量不是完整计费记录。日志脱敏不等同于磁盘加密。

@@ -50,7 +50,7 @@ class SearchController:
 
     def _identity(self, bundle: dict, system: str) -> dict:
         config = asdict(self.settings)
-        for key in ('evaluation_budget','heartbeat_seconds','data_dir','target_input','validation_inputs','protected_input'):
+        for key in ('evaluation_budget','heartbeat_seconds','show_code','data_dir','target_input','validation_inputs','protected_input'):
             config.pop(key)
         implementation = {p.name:hashlib.sha256(p.read_bytes().replace(b'\r\n',b'\n')).hexdigest()
                           for p in sorted(Path(__file__).parent.glob('*.py'))}
@@ -97,6 +97,7 @@ class SearchController:
             self.pending.pop('algorithm_code')
             self.pending['stage'] = 'evaluation'
             artifacts.log(f"{self.pending['candidate_id']} recovered saved LLM response without new API request",event='source_recovered')
+            self._log_candidate(artifacts,self.pending,source)
         # Detect edits to archived or pending source before any new API request.
         for row in [*self.history,*([self.pending] if self.pending else [])]:
             if row.get('source_path') and row.get('source_sha256'):
@@ -124,6 +125,43 @@ class SearchController:
         parent = self.rng.choice(pool) if pool else None
         direction,trace = self.bandit.select_with_trace()
         return parent,direction,trace,'diverse_pareto_parent' if parent else 'no_source_restart'
+
+    def _log_candidate(self, artifacts: RunArtifacts, row: dict, source: str) -> None:
+        candidate_id = row['candidate_id']
+        for key in ('algorithm_idea','change_hypothesis','expected_improvement','change_summary'):
+            artifacts.log(f"{candidate_id} {key}: {row.get(key,'N/A')}",event='llm_explanation')
+        if self.settings.show_code:
+            numbered = '\n'.join(f'{index:04d} | {line}' for index,line in enumerate(source.splitlines(),1))
+            artifacts.log(f'{candidate_id} returned source BEGIN (not executed/validated yet)\n{numbered}\n'
+                          f'{candidate_id} returned source END; file={row["source_path"]}',event='llm_code')
+        else:
+            artifacts.log(f'{candidate_id} source display disabled; file={row["source_path"]}',event='llm_code')
+
+    def _observe_response(self, artifacts: RunArtifacts, message: str, fields: dict) -> None:
+        candidate_id = self.pending['candidate_id'] if self.pending else 'unknown'
+        kind = fields.pop('kind','api_request')
+        if kind == 'llm_response':
+            path = f'responses/{candidate_id}.json'
+            artifacts.write_json(path,fields)
+            self.pending['response_path'] = path
+            artifacts.log(f"{candidate_id} finish_reason={fields.get('finish_reason')} "
+                          f"response_chars={fields.get('response_chars')} usage={fields.get('usage')} "
+                          f"public_response={path}",event='llm_response',candidate_id=candidate_id,
+                          response_path=path,finish_reason=fields.get('finish_reason'),usage=fields.get('usage'))
+        elif kind == 'llm_response_invalid':
+            path = self.pending.get('response_path')
+            content = getattr(self.client,'last_response',{}).get('content','')
+            # Adapters may expose only last_metadata, so read the already saved
+            # redacted public body instead of ever dumping a provider object.
+            if path:
+                saved = json.loads(safe_child(artifacts.root,path).read_text(encoding='utf-8'))
+                content = saved.get('content','')
+            visible = content[:12000] or '<empty final content>'
+            suffix = f'\n[console limited to 12000 chars; complete public body: {path}]' if len(content)>12000 else ''
+            artifacts.log(f'{candidate_id} {message}\nPUBLIC RESPONSE BEGIN\n{visible}{suffix}\n'
+                          f'PUBLIC RESPONSE END; diagnostic={path}',event=kind,candidate_id=candidate_id)
+        else:
+            artifacts.log(f'{candidate_id} {message}',event=kind,candidate_id=candidate_id,**fields)
 
     def _prompt(self, parent: dict | None, direction: str, artifacts: RunArtifacts) -> str:
         feedback = {
@@ -276,8 +314,7 @@ class SearchController:
         artifacts.write_json('config_snapshot.json',self.identity)
         if hasattr(self.client,'set_observer'):
             def observe(message,**fields):
-                candidate_id = self.pending['candidate_id'] if self.pending else None
-                artifacts.log(f'{candidate_id} {message}',event='api_request',candidate_id=candidate_id,**fields)
+                self._observe_response(artifacts,message,fields)
             self.client.set_observer(observe)
         artifacts.log(f"Search v3 origin={'offline_mock' if self.mock else 'llm'} datasets={len(self.bundle['datasets'])} "
                       f"completed={len(self.history)} budget={self.settings.evaluation_budget}; objective={OBJECTIVE_VERSION}",event='search_start')
@@ -321,6 +358,7 @@ class SearchController:
                     artifacts.write_text(row['source_path'],generated.algorithm_code)
                     row.pop('algorithm_code')
                     row['stage'] = 'evaluation'
+                    self._log_candidate(artifacts,row,generated.algorithm_code)
                     artifacts.log(f"{row['candidate_id']} LLM finished in {row['llm_seconds']:.3f}s",event='llm_end',api_metadata=row['api_metadata'])
                     self._persist(artifacts)
                 row = self.pending
