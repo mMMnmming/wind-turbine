@@ -309,7 +309,14 @@ def main() -> int:
     parser.add_argument("--gust-speed-mps", type=float)
     parser.add_argument("--evaluation-output", type=Path)
     parser.add_argument("--random-samples", type=int, default=1000)
-    parser.add_argument("--evaluation-seed", type=int, default=1234)
+    parser.add_argument("--evaluation-seed", type=int)
+    parser.add_argument("--architecture", choices=("legacy", "edge_attention_v2"))
+    parser.add_argument("--rollouts-per-instance", type=int)
+    parser.add_argument("--decode-strategy", choices=("greedy", "best_of_n"))
+    parser.add_argument("--decode-samples", type=int, help="Network candidates, including one greedy; not --random-samples.")
+    parser.add_argument("--decode-chunk-size", type=int)
+    parser.add_argument("--lr-min", type=float)
+    parser.add_argument("--lr-schedule-epochs", type=int)
     parser.add_argument("--plot-dpi", type=int, default=300)
     args = parser.parse_args()
     args.input = _resolve_input_path(args.mode, args.input)
@@ -317,7 +324,8 @@ def main() -> int:
     saved_config = json.loads(args.config.read_text(encoding="utf-8"))
     for name in ("device", "seed", "data_seed", "epochs", "batch_size", "batches_per_epoch", "virtual_fields",
                  "learning_rate", "energy_weight", "gust_speed_mps", "refresh_every_epochs", "refresh_fields",
-                 "stratified_sampling"):
+                 "stratified_sampling", "architecture", "rollouts_per_instance", "decode_strategy",
+                 "decode_samples", "decode_chunk_size", "evaluation_seed", "lr_min", "lr_schedule_epochs"):
         value = getattr(args, name)
         if value is not None:
             saved_config[name] = value
@@ -328,6 +336,9 @@ def main() -> int:
     )
     gust_speed_mps = float(saved_config.get("gust_speed_mps", 12.0))
     max_kde_attempts = int(saved_config.get("kde_max_attempts_per_field", 20))
+
+    if args.mode == "search" and saved_config.get("architecture", "legacy") != "legacy":
+        parser.error("Legacy hyperparameter search does not support edge_attention_v2; train the final configuration directly.")
 
     if args.mode == "evaluate":
         instances = load_region_instances(args.regions_json, args.stage1_config, gust_speed_mps) if args.regions_json else build_deployment_instances(args.input, args.stage1_config, gust_speed_mps)
@@ -467,23 +478,43 @@ def _evaluate(args: argparse.Namespace, parser: argparse.ArgumentParser, instanc
 
     from stage1.deployment import load_config
     from .evaluation import evaluate_route, nearest_neighbor_route, random_route_summary, write_evaluation_artifacts
-    from .model import GraphPointerNetwork, make_node_features
+    from .model import make_node_features
+    from .policy import build_policy, infer_instance, TIMING_SCOPE
 
     source_name = (args.regions_json or args.input).stem
     evaluation_output = args.evaluation_output or args.output / "evaluations" / f"{source_name}_{args.checkpoint.stem}"
     if any((evaluation_output / name).exists() for name in ("data_manifest.json", "reference_results.json")):
         parser.error("Evaluation output must be separate from immutable training/reference data.")
+    if any((evaluation_output / name).exists() for name in ("model_metrics.json", "greedy_metrics.json")):
+        parser.error("Evaluation results already exist. Use a new --evaluation-output; nothing was overwritten.")
     payload = torch.load(args.checkpoint, map_location=device, weights_only=False)
     config = payload["training_config"]
+    architecture = payload.get("architecture", config.get("architecture", "legacy"))
+    if architecture != config.get("architecture", "legacy"):
+        parser.error("Checkpoint architecture metadata is inconsistent.")
+    if args.architecture is not None and args.architecture != architecture:
+        parser.error("Evaluation architecture differs from checkpoint; no weight migration is supported.")
+    strategy = args.decode_strategy or config.get("decode_strategy", "greedy")
+    candidate_count = args.decode_samples if args.decode_samples is not None else config.get("decode_samples", 128 if strategy == "best_of_n" else 1)
+    # An explicit sampling request on an old checkpoint gets the full default budget.
+    if args.decode_strategy == "best_of_n" and args.decode_samples is None and config.get("decode_strategy", "greedy") != "best_of_n":
+        candidate_count = 128
+    chunk_size = args.decode_chunk_size if args.decode_chunk_size is not None else config.get("decode_chunk_size", 32)
+    args.evaluation_seed = args.evaluation_seed if args.evaluation_seed is not None else config.get("evaluation_seed", 1234)
+    if candidate_count < 1 or chunk_size < 1 or args.evaluation_seed < 0:
+        parser.error("Decode counts must be positive and evaluation seed nonnegative.")
+    candidate_count = candidate_count if strategy == "best_of_n" else 1
+    method = f"model_best_of_{candidate_count}" if strategy == "best_of_n" else "model_greedy"
     trained_environment = payload.get("wind_environment", {})
     instances = _resolve_evaluation_environment(instances, trained_environment, frozen_input=args.regions_json is not None)
     from .benchmark import load_references, reference_summary
     references = load_references(args.reference_results, instances) if args.reference_results else None
-    model = GraphPointerNetwork(config["hidden_dim"], config["encoder_layers"], config["heads"]).to(device)
+    model = build_policy(config).to(device)
     model.load_state_dict(payload["model"])
     model.eval()
     evaluations = []
     model_metrics = []
+    greedy_metrics = []
     for region, instance in enumerate(instances, start=1):
         coordinates = torch.tensor(instance.coordinates_km, dtype=torch.float32, device=device).unsqueeze(0)
         features = make_node_features(
@@ -492,24 +523,42 @@ def _evaluate(args: argparse.Namespace, parser: argparse.ArgumentParser, instanc
             instance.config.wind_direction_degrees,
             instance.config.gust_speed_mps,
         )
-        if instance.node_count == 1:
+        if strategy == "best_of_n" or architecture == "edge_attention_v2":
+            selected = infer_instance(model, instance, torch.device(device), strategy, candidate_count,
+                                      chunk_size, args.evaluation_seed)
+            route, inference_seconds = selected["route"], selected["runtime_seconds"]
+        elif instance.node_count == 1:
             route, inference_seconds = (0, 0), 0.0
         else:
             route, inference_seconds = _timed_greedy_route(model, features)
-        model_report = evaluate_route(instance, "model_greedy", route)
+        model_report = evaluate_route(instance, method, route)
         model_metrics.append({
             "region": region, "nest_id": instance.identifiers[instance.depot_index],
             "node_count": instance.node_count, "instance_fingerprint": instance_fingerprint(instance),
             "instance": instance_to_record(instance), "route": list(route),
             "flight_seconds": model_report.flight_seconds, "runtime_seconds": inference_seconds,
             "equivalent_energy_seconds": model_report.equivalent_energy_seconds, "feasible": model_report.feasible,
+            "method": method, "candidate_count": candidate_count,
         })
+        if strategy == "best_of_n" or architecture == "edge_attention_v2":
+            model_metrics[-1].update({key: selected[key] for key in
+                                     ("feasible_candidate_count", "unique_route_fraction")})
+        if strategy == "best_of_n":
+            single = infer_instance(model, instance, torch.device(device), "greedy", 1, chunk_size, args.evaluation_seed)
+            single_report = single["metrics"]
+            greedy_metrics.append({**model_metrics[-1], "method": "model_greedy", "candidate_count": 1,
+                                   "route": list(single["route"]), "flight_seconds": single_report.flight_seconds,
+                                   "runtime_seconds": single["runtime_seconds"], "feasible": single_report.feasible,
+                                   "equivalent_energy_seconds": single_report.equivalent_energy_seconds,
+                                   "feasible_candidate_count": int(single_report.feasible), "unique_route_fraction": 1.0})
+        else:
+            greedy_metrics.append(dict(model_metrics[-1]))
         nearest_report = evaluate_route(instance, "nearest_neighbor", nearest_neighbor_route(instance))
         random_report = random_route_summary(instance, args.random_samples, args.evaluation_seed + region - 1)
         evaluations.append((region, instance, model_report, nearest_report, random_report))
         print(
             f"Region {region:02d} | nest={instance.identifiers[0]} | nodes={instance.node_count} | "
-            f"model flight={model_report.flight_seconds:.2f}s | inference={inference_seconds:.6f}s | "
+            f"{method} flight={model_report.flight_seconds:.2f}s | inference={inference_seconds:.6f}s | "
             f"feasible={model_report.feasible} | nearest flight={nearest_report.flight_seconds:.2f}s | "
             f"random feasible={random_report.feasible_count}/{random_report.sample_count}", flush=True,
         )
@@ -553,6 +602,11 @@ def _evaluate(args: argparse.Namespace, parser: argparse.ArgumentParser, instanc
     summary["evaluation_split"] = split_name
     totals = _model_totals(model_metrics, len(instances))
     summary["model_totals"] = totals
+    summary["model_method"] = method
+    summary["greedy_totals"] = _model_totals(greedy_metrics, len(instances))
+    summary["decoding"] = {"strategy": strategy, "candidate_count": candidate_count,
+                           "chunk_size": chunk_size, "evaluation_seed": args.evaluation_seed,
+                           "sampling_note": "Candidates follow network probabilities, not uniformly shuffled tours."}
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     (evaluation_output / f"{split_name}_regions.json").write_text(
         json.dumps({"split": split_name, "regions": _instances_as_dict(instances)}, ensure_ascii=False, indent=2) + "\n",
@@ -561,14 +615,25 @@ def _evaluate(args: argparse.Namespace, parser: argparse.ArgumentParser, instanc
     metrics_path = evaluation_output / "model_metrics.json"
     temporary = metrics_path.with_suffix(".json.tmp")
     temporary.write_text(json.dumps({
-        "schema_version": 1, "method": "model_greedy", "checkpoint": str(args.checkpoint),
+        "schema_version": 1, "method": method, "architecture": architecture, "checkpoint": str(args.checkpoint),
+        "candidate_count": candidate_count, "decode_chunk_size": chunk_size, "evaluation_seed": args.evaluation_seed,
         "checkpoint_sha256": input_hashes["checkpoint_sha256"], "device": str(device),
         "evaluation_split": split_name,
         "summary": totals, "split_fingerprint": split_fingerprint(instances),
-        "timing_scope": "One greedy forward/decode and route transfer to host, synchronized on CUDA; excludes model loading, features, baselines, plotting and file I/O; no warm-up or repeats.",
+        "timing_scope": TIMING_SCOPE if strategy == "best_of_n" or architecture == "edge_attention_v2" else
+                        "One greedy forward/decode and route transfer to host, synchronized on CUDA; excludes model loading, features, baselines, plotting and file I/O; no warm-up or repeats.",
         "results": model_metrics,
     }, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     temporary.replace(metrics_path)
+    main_payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+    greedy_payload = {**main_payload, "method": "model_greedy", "candidate_count": 1,
+                      "results": greedy_metrics, "summary": summary["greedy_totals"]}
+    if strategy == "best_of_n":
+        greedy_payload["timing_scope"] = ("Independent single graph encoding and greedy decoding, host transfer and "
+                                          "original-environment route check; CUDA synchronized; excludes loading, "
+                                          "features, baselines, plotting and I/O; no warm-up or repeats.")
+    (evaluation_output / "greedy_metrics.json").write_text(
+        json.dumps(greedy_payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     print(f"Model totals | regions={len(instances)} | flight={totals['total_flight_seconds']:.6f}s | "
           f"inference={totals['total_runtime_seconds']:.6f}s | infeasible={totals['infeasible_region_count']}", flush=True)
     print(f"Evaluated {len(instances)} routing regions. Results: {evaluation_output}")

@@ -181,6 +181,8 @@ def compare_results(model_payload: dict, reference_payload: dict) -> dict:
     return {
         "schema_version": 1, "rows": rows, "summary": summarize_rows(rows, expected_count), "warnings": warnings,
         "model_device": model_payload.get("device", "not recorded"),
+        "model_method": model_payload.get("method", "model_greedy (legacy metadata)"),
+        "model_candidate_count": model_payload.get("candidate_count", 1),
         "model_checkpoint_sha256": model_payload.get("checkpoint_sha256"),
         "model_timing_scope": model_payload.get("timing_scope", "not recorded"),
         "bnb_timing_scope": reference_payload.get("timing_scope", "B&B search to proof/explicit stop; accumulated active time."),
@@ -202,6 +204,7 @@ def write_comparison(report: dict, output: Path) -> str:
     if any(path.exists() for path in paths):
         raise FileExistsError("Comparison files already exist. Choose a new --output directory.")
     table = ["| " + " | ".join(COLUMNS.values()) + " |", "| " + " | ".join("---" for _ in COLUMNS) + " |"]
+    table.insert(0, f"模型方法：{report.get('model_method', 'not recorded')}；候选数：{report.get('model_candidate_count', 1)}。\n")
     for row in report["rows"]:
         table.append("| " + " | ".join(_cell(row[key]) for key in COLUMNS) + " |")
     summary = report["summary"]
@@ -227,11 +230,12 @@ def write_comparison(report: dict, output: Path) -> str:
     output.mkdir(parents=True, exist_ok=True)
     # UTF-8 BOM allows Excel to recognize the Chinese column headings.
     with paths[0].open("w", encoding="utf-8-sig", newline="") as handle:
-        fields = [*COLUMNS, "row_type", "nest_id", "instance_fingerprint", "model_feasible", "bnb_feasible", "bnb_termination", "bnb_proven_optimal"]
+        fields = [*COLUMNS, "row_type", "nest_id", "instance_fingerprint", "model_feasible", "bnb_feasible", "bnb_termination", "bnb_proven_optimal", "model_method", "model_candidate_count"]
         writer = csv.DictWriter(handle, fieldnames=[COLUMNS.get(key, key) for key in fields])
         writer.writeheader()
         for row in report["rows"]:
-            row = {**row, "row_type": "region"}
+            row = {**row, "row_type": "region", "model_method": report.get("model_method"),
+                   "model_candidate_count": report.get("model_candidate_count", 1)}
             # Prevent spreadsheet formulas if external node identifiers start with = etc.
             writer.writerow({COLUMNS.get(key, key): "'" + value if isinstance(value, str) and value.startswith(("=", "+", "-", "@"))
                              else value for key, value in row.items()})

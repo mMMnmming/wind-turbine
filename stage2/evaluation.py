@@ -207,7 +207,8 @@ def _draw_route(ax: plt.Axes, instance: WindATSPInstance, report: RouteReport, s
                 linewidth=1.15, color="dimgray", alpha=0.9, zorder=2,
             )
         )
-    ax.plot([], [], color="dimgray", linewidth=1.15, label="Greedy Route")
+    label = "Network Best-of-" + report.method.removeprefix("model_best_of_") if report.method.startswith("model_best_of_") else "Greedy Route"
+    ax.plot([], [], color="dimgray", linewidth=1.15, label=label)
     padding = 0.5
     ax.set_xlim(coordinates[:, 0].min() - padding, coordinates[:, 0].max() + padding)
     ax.set_ylim(coordinates[:, 1].min() - padding, coordinates[:, 1].max() + padding)
@@ -247,7 +248,8 @@ def _write_overview(path: Path, evaluations: list[tuple[int, WindATSPInstance, R
 def _write_cost_comparison(path: Path, rows: list[dict[str, object]], dpi: int) -> None:
     _configure_plot_style()
     regions = sorted({int(row["region"]) for row in rows})
-    methods = ("model_greedy", "nearest_neighbor", "random_seeded_median_feasible")
+    model_method = next(row["method"] for row in rows if str(row["method"]).startswith("model_"))
+    methods = (model_method, "nearest_neighbor", "random_seeded_median_feasible")
     labels = ("Model", "Nearest neighbour", "Random median")
     colors = ("dimgray", "#E69F00", "#56B4E9")
     fig, ax = plt.subplots(figsize=(10, 6.5))
@@ -280,6 +282,7 @@ def write_evaluation_artifacts(
     """Write all human-readable, machine-readable, and graphical artifacts."""
     output.mkdir(parents=True, exist_ok=True)
     rows = _comparison_rows(evaluations)
+    model_method = evaluations[0][2].method
     fieldnames = list(rows[0]) if rows else []
     with (output / "evaluation_regions.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -293,7 +296,7 @@ def write_evaluation_artifacts(
                 "region": region,
                 "nest_id": instance.identifiers[instance.depot_index],
                 "node_count": instance.node_count,
-                "model_greedy": _route_dict(model),
+                model.method: _route_dict(model),
                 "nearest_neighbor": _route_dict(nearest),
                 "random_seeded": {**asdict(random_summary), "representative": _route_dict(random_summary.representative)},
             }
@@ -311,12 +314,12 @@ def write_evaluation_artifacts(
                 "mean_route_distance_km": float(mean(float(row["route_distance_km"]) for row in rows if row["method"] == method and row["route_distance_km"] != "")),
                 "feasible_route_rate": float(mean(bool(row["feasible"]) for row in rows if row["method"] == method)),
             }
-            for method in ("model_greedy", "nearest_neighbor", "random_seeded_median_feasible")
+            for method in (model_method, "nearest_neighbor", "random_seeded_median_feasible")
             if any(row["method"] == method and row["equivalent_energy_seconds"] != "" for row in rows)
         },
     }
-    if "model_greedy" in summary["method_summary"] and "nearest_neighbor" in summary["method_summary"]:
-        model_flight = summary["method_summary"]["model_greedy"]["mean_flight_seconds"]
+    if model_method in summary["method_summary"] and "nearest_neighbor" in summary["method_summary"]:
+        model_flight = summary["method_summary"][model_method]["mean_flight_seconds"]
         nearest_flight = summary["method_summary"]["nearest_neighbor"]["mean_flight_seconds"]
         summary["model_vs_nearest_neighbor"] = {
             "mean_flight_seconds_reduction": nearest_flight - model_flight,

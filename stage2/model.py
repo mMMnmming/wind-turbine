@@ -39,6 +39,10 @@ class GraphPointerNetwork(nn.Module):
         excluded from both encoder attention and decoder actions. Each row stops
         decoding after visiting its own valid clients.
         """
+        return self.decode(self.encode(features, valid_node_mask=valid_node_mask), decode_type)
+
+    def encode(self, features: Tensor, valid_node_mask: Tensor | None = None, **unused) -> dict[str, Tensor]:
+        """Cache the unchanged legacy encoder for policy-guided multi-sampling."""
         if features.ndim != 3 or features.size(-1) != self.feature_count:
             raise ValueError(f"features must have shape (batch, nodes, {self.feature_count}).")
         batch_size, node_count, _ = features.shape
@@ -53,10 +57,20 @@ class GraphPointerNetwork(nn.Module):
             raise ValueError("Every graph must have a valid depot and at least one client.")
 
         encoded = self.encoder(self.embedding(features), src_key_padding_mask=~valid_node_mask)
+        return {"encoded": encoded, "valid": valid_node_mask}
+
+    def decode(self, cache: dict[str, Tensor], decode_type: str = "sample", rollouts: int = 1,
+               generator: torch.Generator | None = None) -> tuple[Tensor, Tensor]:
+        """Keep legacy decisions/log-probabilities; optionally reuse one encoding."""
+        if decode_type not in ("sample", "greedy") or rollouts < 1:
+            raise ValueError("Invalid decode type or rollout count.")
+        encoded = cache["encoded"].repeat_interleave(rollouts, dim=0)
+        valid_node_mask = cache["valid"].repeat_interleave(rollouts, dim=0)
+        batch_size, node_count, _ = encoded.shape
         depot = encoded[:, 0]
         query = depot
         keys = self.key(encoded)
-        visited = torch.zeros(batch_size, node_count, dtype=torch.bool, device=features.device)
+        visited = torch.zeros(batch_size, node_count, dtype=torch.bool, device=encoded.device)
         visited[:, 0] = True
         client_counts = valid_node_mask.sum(dim=1) - 1
         selected: list[Tensor] = []
@@ -72,13 +86,18 @@ class GraphPointerNetwork(nn.Module):
             # Completed rows take a harmless depot placeholder with zero log-P.
             logits = torch.where(active.unsqueeze(1), logits, torch.zeros_like(logits))
             distribution = torch.distributions.Categorical(logits=logits)
-            action = torch.argmax(logits, dim=-1) if decode_type == "greedy" else distribution.sample()
+            if decode_type == "greedy":
+                action = torch.argmax(logits, dim=-1)
+            elif generator is None:
+                action = distribution.sample()
+            else:
+                action = torch.multinomial(distribution.probs, 1, generator=generator).squeeze(1)
             action = torch.where(active, action, torch.zeros_like(action))
-            log_probability = torch.where(active, distribution.log_prob(action), torch.zeros_like(action, dtype=features.dtype))
+            log_probability = torch.where(active, distribution.log_prob(action), torch.zeros_like(action, dtype=encoded.dtype))
             selected.append(action)
             log_probabilities.append(log_probability)
             visited.scatter_(1, action.unsqueeze(1), visited.gather(1, action.unsqueeze(1)) | active.unsqueeze(1))
-            query = encoded[torch.arange(batch_size, device=features.device), action]
+            query = encoded[torch.arange(batch_size, device=encoded.device), action]
 
         return torch.stack(selected, dim=1), torch.stack(log_probabilities, dim=1).sum(dim=1)
 

@@ -37,6 +37,14 @@ class TrainingConfig:
     safety_penalty: float = 20.0
     safety_overshoot_penalty: float = 10.0
     stratified_sampling: bool = False
+    architecture: str = "legacy"
+    rollouts_per_instance: int = 1
+    decode_strategy: str = "greedy"
+    decode_samples: int = 1
+    decode_chunk_size: int = 32
+    evaluation_seed: int = 1234
+    lr_min: float = 1e-5
+    lr_schedule_epochs: int = 200
 
 
 def require_device(requested: str) -> torch.device:
@@ -267,6 +275,15 @@ def train(
     references: dict[str, dict] | None = None,
 ) -> Path:
     """Train one policy over diverse regions and select best by held-out validation."""
+    if config.architecture == "edge_attention_v2":
+        from .train_v2 import train_edge_policy
+        return train_edge_policy(instances, config, output, validation_instances, resume_checkpoint, pool, references)
+    if config.architecture != "legacy":
+        raise ValueError(f"Unknown architecture: {config.architecture}")
+    if resume_checkpoint is not None:
+        saved = torch.load(resume_checkpoint, map_location="cpu", weights_only=False)
+        if saved.get("architecture", saved["training_config"].get("architecture", "legacy")) != "legacy":
+            raise ValueError("Resume architecture differs from the checkpoint; start a fresh run.")
     if not instances:
         raise ValueError("At least one Stage-1 or synthetic routing instance is required.")
     if not validation_instances:
