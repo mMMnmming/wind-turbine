@@ -53,32 +53,34 @@ python -u "stage1+llm/run.py" prepare-data
 
 搜索输入会与87坐标核对，拒绝把87或包含它的189当搜索数据。保护检查不把87坐标或成绩发送给LLM。验证集参与选优，不能称为最终盲测集。
 
-## 4. 先真实1轮连通性试跑，再运行完整搜索
+## 4. 先真实3轮试跑（允许修复），再运行完整搜索
 
 以下命令会调用收费API，由你决定何时运行：
 
 ```bash
-python -u "stage1+llm/run.py" optimize --run-id trial-v3-stream --evaluation-budget 1 --thinking disabled --max-tokens 8192 --api-retries 1 --stream --show-code
+python -u "stage1+llm/run.py" optimize --run-id trial-v3-contract --evaluation-budget 3 --thinking disabled --max-tokens 8192 --api-retries 0 --stream --show-code
 ```
 
 完整前台运行，逐轮直接显示在控制台：
 
 ```bash
-python -u "stage1+llm/run.py" optimize --run-id search-v3-stream --thinking disabled --max-tokens 8192 --api-retries 1 --stream --show-code
+python -u "stage1+llm/run.py" optimize --run-id search-v3-contract --thinking disabled --max-tokens 8192 --api-retries 1 --stream --show-code
 ```
 
-1轮仅用于验证“请求→正文→代码检查→17份数据评估”能否完成，不代表算法已经搜索充分。默认完整搜索3个独立初始候选、最多40轮、前沿连续10轮无改善停止。生成失败占1轮；每轮SDK重试可能增加实际HTTP请求。日志记录实际尝试数及最终响应可获得的token用量，**不是账单，也不保证覆盖所有重试的计费用量**。`--api-retries 0` 可禁用传输重试；不会因解析失败或断流自动重新付费生成。
+3轮只是小预算检查，不保证得到可行算法。完整流程为“请求→公开正文→源码校验→两项小图预检→17份数据评估”。也可显式设置 `--evaluation-budget 1` 只测一轮，但失败后没有剩余预算修复。完整搜索默认计划3个独立初始尝试、最多40轮、前沿连续10轮无改善停止；**尚无可部署方案且有失败源码时，下一轮先修复该源码，修复占总预算，但不占独立初始尝试计数**。不再先花完3次独立生成才处理已有错误。
+
+生成或运行失败均占1轮；每轮SDK重试可能增加实际HTTP请求。日志记录实际尝试数及最终响应可获得的token用量，**不是账单，也不保证覆盖所有重试的计费用量**。`--api-retries 0` 可禁用传输重试；解析失败或断流不在当前轮内自动重发。**有剩余逻辑预算时，后续修复轮次仍会发起新的收费LLM请求**；没有预算不额外调用。
 
 Linux后台单行命令，外层日志以日期命名：
 
 ```bash
-mkdir -p "stage1+llm/outputs/console" && nohup python -u "stage1+llm/run.py" optimize --run-id search-v3-stream --thinking disabled --max-tokens 8192 --api-retries 1 --stream --show-code > "stage1+llm/outputs/console/$(date +%Y%m%d_%H%M%S).log" 2>&1 < /dev/null &
+mkdir -p "stage1+llm/outputs/console" && nohup python -u "stage1+llm/run.py" optimize --run-id search-v3-contract --thinking disabled --max-tokens 8192 --api-retries 1 --stream --show-code > "stage1+llm/outputs/console/$(date +%Y%m%d_%H%M%S).log" 2>&1 < /dev/null &
 ```
 
 实时看每轮过程：
 
 ```bash
-tail -F "stage1+llm/outputs/search-v3-stream/search.log"
+tail -F "stage1+llm/outputs/search-v3-contract/search.log"
 ```
 
 日志为UTC时间，示意（非实验成绩）：
@@ -96,6 +98,10 @@ tail -F "stage1+llm/outputs/search-v3-stream/search.log"
 [llm_explanation] C.... algorithm_idea: ...
 [llm_code] C.... returned source BEGIN (not executed/validated yet)
 [llm_code] 0001 | def solve(turbines, config, seed):
+[preflight_start] C.... case=single nodes=1 timeout=5s; interface/runtime only, not a deployment score
+[preflight_end] C.... case=single PASS ... full deployment checks still required
+[preflight_start] C.... case=small nodes=4 timeout=5s; ...
+[preflight_end] C.... case=small PASS ...
 [dataset_start] C.... dataset=... nodes=102 start
 [dataset_end] ... feasible=... nests=... proxy_flight=... max_tasks=... algorithm=... evaluator=...
 [iteration_end] ... reward=... decision=... objectives=... delta=... front=... stalled=...
@@ -117,12 +123,22 @@ tail -F "stage1+llm/outputs/search-v3-stream/search.log"
 - 非法JSON：显示行、列及字符数，在控制台展示公开正文前12000字符，完整正文仍在诊断文件。
 - 无choices、过滤或其他中断：分别报告，不冒充可部署候选。
 
-这次仅修改调用预算、公开输出、提示词紧凑程度和完整性检查，不改变部署硬约束、三目标或进化评分。旧版本未保存的失败响应无法事后恢复。此更新改变了实现和提示词哈希，旧搜索不能混用新实现续跑；先保留旧任务产物，新版本使用新run ID，例如 `trial-v3-stream`。无需覆盖旧目录。
+这次接口加固不改变部署硬约束、三目标或方向奖励。旧版本未保存的失败响应无法事后恢复。实现和提示词哈希已改变，旧搜索不能混用新实现续跑；先保留旧任务产物，新版本使用新run ID，例如 `trial-v3-contract`。无需覆盖旧目录。
+
+### 风机输入、预检与失败修复
+
+`solve(turbines, config, seed)` 的风机记录现在同时支持 `t.identifier/t.x_km/t.y_km` 和 `t['identifier']/t['x_km']/t['y_km']`，读取的是相同字段；`config` 仍使用属性访问。适配在受限子进程里完成，**不重写LLM返回的源码，不改变父进程原始坐标**。返回值仍必须是 `nest_ids` 列表和 `assignments` 映射。
+
+正式评估前用1点和4点人工小图各运行一次，单项超时为 `min(5, candidate_timeout_seconds)` 秒。预检只查程序能否执行及返回类型，**不是覆盖/半径/续航验收，不进入17份数据的目标统计，也不证明程序不会在大图上超时**。两项通过后仍须在固定数据集上全部验算。预检耗时单列在逐轮JSON和 `trajectory.csv` 的 `preflight_seconds`，不冒充真实数据算法运行时间。
+
+`candidate_error` 会带 `failure_stage`（source_validation/preflight/dataset）、失败数据集及异常。已经完成部分数据时，后续异常也完整反馈给修复父代。修复候选使用真正失败的源码，不是另外生成一个无关算法；生成的程序仍可能有错，所有修复都要重新预检和评估。提示词要求修复循环有界，但没有静默修改生成代码来强行成功。超过子进程时限仍记失败。
+
+预检已完成的小项会原子保存，正常恢复跳过，不重复请求模型。`summary.json` 区分生成源码数 `generated_sources`、预检通过数 `preflight_passed` 和完整数据评估数 `fully_evaluated_candidates`；不要把“有源码”或“预检通过”当成可部署结果。预算耗尽且没有可部署方案时额外显示 `repair_budget_exhausted`，明确说明没有偷偷增加API调用。
 
 ## 5. 看方案、手动选定、最后评估87
 
 ```bash
-python -u "stage1+llm/run.py" list-candidates --run-id search-v3-stream
+python -u "stage1+llm/run.py" list-candidates --run-id search-v3-contract
 ```
 
 控制台显示候选编号、跨实例平均机巢数、平均总飞行时间（启发式）、最大区域任务数和三目标。逐数据集原始指标在 `evaluations/*.json`，不要把跨实例平均数当成87成绩。
@@ -130,15 +146,15 @@ python -u "stage1+llm/run.py" list-candidates --run-id search-v3-stream
 例如看完表后选C0007（**请替换成真实存在且仍在前沿的编号**）：
 
 ```bash
-python -u "stage1+llm/run.py" export-best --run-id search-v3-stream --candidate-id C0007 --reason "根据机巢成本和最大区域规模选择"
+python -u "stage1+llm/run.py" export-best --run-id search-v3-contract --candidate-id C0007 --reason "根据机巢成本和最大区域规模选择"
 ```
 
-输出 `outputs/search-v3-stream/selected/C0007/algorithm.py`、选择记录及已评估的指标。没有默认的 `best_algorithm.py`，也没有隐含加权选模。
+输出 `outputs/search-v3-contract/selected/C0007/algorithm.py`、选择记录及已评估的指标。没有默认的 `best_algorithm.py`，也没有隐含加权选模。
 
 固定选择后评估87，不回写搜索奖励：
 
 ```bash
-python -u "stage1+llm/run.py" evaluate --candidate "stage1+llm/outputs/search-v3-stream/selected/C0007/algorithm.py" --input turbine87.tsv --run-id test87-C0007
+python -u "stage1+llm/run.py" evaluate --candidate "stage1+llm/outputs/search-v3-contract/selected/C0007/algorithm.py" --input turbine87.tsv --run-id test87-C0007
 ```
 
 可行时输出：
@@ -155,13 +171,13 @@ python -u "stage1+llm/run.py" evaluate --candidate "stage1+llm/outputs/search-v3
 ## 6. 恢复规则
 
 ```bash
-python -u "stage1+llm/run.py" resume --resume-run-id search-v3-stream --thinking disabled --max-tokens 8192 --api-retries 1 --stream --show-code
+python -u "stage1+llm/run.py" resume --resume-run-id search-v3-contract --thinking disabled --max-tokens 8192 --api-retries 1 --stream --show-code
 ```
 
 增加预算（只能增大，其他实验身份保持不变）：
 
 ```bash
-python -u "stage1+llm/run.py" resume --resume-run-id search-v3-stream --evaluation-budget 60 --reset-stall --thinking disabled --max-tokens 8192 --api-retries 1 --stream --show-code
+python -u "stage1+llm/run.py" resume --resume-run-id search-v3-contract --evaluation-budget 60 --reset-stall --thinking disabled --max-tokens 8192 --api-retries 1 --stream --show-code
 ```
 
 若3轮试跑覆盖了 `--no-improvement-limit 3`，恢复也须带同值；正式默认是10。恢复核对数据哈希、物理约束、目标、模型配置、提示词及实现哈希，拒绝不同实验混用。数据内容相同而目录搬迁不影响逻辑身份；源文件的字节哈希变化仍会被拒绝。

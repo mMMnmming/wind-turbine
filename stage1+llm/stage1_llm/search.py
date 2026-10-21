@@ -13,7 +13,7 @@ from .artifacts import RunArtifacts, run_path, safe_child, redact_secrets
 from .candidate import validate_candidate_source
 from .client import DeepSeekClient, DeepSeekSettings
 from .data import fingerprint, prepare_data, turbines_from_record
-from .domain import result_as_dict
+from .domain import Turbine, result_as_dict
 from .evaluator import evaluate_proposal
 from .exports import write_front
 from .reward import OBJECTIVE_VERSION, pareto_front, parent_pool, search_reward
@@ -106,10 +106,15 @@ class SearchController:
                     raise ValueError('Saved candidate source hash changed.')
 
     def _choose(self) -> tuple[dict | None,str,dict,str]:
-        if len(self.history) < self.settings.initial_candidates:
-            direction = INITIAL_DIRECTIONS[len(self.history)%3]
+        independent_count = sum(row.get('selection_reason') == 'independent_initial' for row in self.history)
+        # An unusable source should receive its own traceback on the very next
+        # round, rather than paying for more unrelated cold starts first.
+        urgent_repair = bool(self.repair_pool) and not self.archive
+        if independent_count < self.settings.initial_candidates and not urgent_repair:
+            direction = INITIAL_DIRECTIONS[independent_count%3]
             return None,direction,{},'independent_initial'
-        repair_due = not self.archive or (len(self.history)-self.settings.initial_candidates+1)%4 == 0
+        evolved_count = len(self.history)-independent_count
+        repair_due = not self.archive or (evolved_count+1)%4 == 0
         if self.repair_pool and repair_due:
             parent = self.repair_pool[-1]
             text = ' '.join(parent['evaluation'].get('violations',[])).lower()
@@ -193,13 +198,56 @@ class SearchController:
                     'violations':list(dict.fromkeys(r.get('violations',[])))}
                     for r in parent['evaluation'].get('datasets',[])],
             }
-            if not parent['evaluation'].get('datasets'):
+            if not parent['evaluation'].get('datasets') or parent['evaluation'].get('status') == 'candidate_error':
                 feedback['parent_diagnostic']['violations'] = parent['evaluation'].get('violations',[])
+            for key in ('failure_stage','failed_dataset'):
+                if parent['evaluation'].get(key):
+                    feedback['parent_diagnostic'][key] = parent['evaluation'][key]
         text = json.dumps(feedback,ensure_ascii=False,separators=(',',':'),default=str)
         source = (artifacts.root/parent['source_path']).read_text(encoding='utf-8') if parent else '无；从零生成。'
         return f'本轮方向必须为 {direction}。\n固定评测诊断：{text}\n父代完整源码：\n{source}'
 
+    def _preflight(self, artifacts: RunArtifacts, row: dict, source_path: Path) -> None:
+        """Cheap interface/runtime checks, not deployment scores or feasibility proof."""
+        row['evaluation_phase'] = 'preflight'
+        check = row.setdefault('preflight',{'status':'running','cases':[],
+            'origin':'synthetic_interface_check','seconds':0.0})
+        if check['status'] == 'passed':
+            return
+        if check['status'] == 'failed':
+            raise RuntimeError(check['error'])
+        cases = (
+            ('single',[(0.0,0.0)]),
+            ('small',[(0.0,0.0),(.1,0.0),(.03,.12),(.11,.09)]),
+        )
+        for name,coordinates in cases[len(check['cases']):]:
+            points = [Turbine(f'preflight-{i}',x,y) for i,(x,y) in enumerate(coordinates)]
+            timeout = min(5,self.settings.candidate_timeout_seconds)
+            artifacts.log(f"{row['candidate_id']} case={name} nodes={len(points)} timeout={timeout}s; "
+                          'interface/runtime only, not a deployment score',event='preflight_start')
+            start = time.perf_counter()
+            try:
+                with artifacts.heartbeat(f"{row['candidate_id']} preflight={name}",self.settings.heartbeat_seconds):
+                    run_candidate(source_path,points,self.settings.deployment,self.settings.seed,timeout)
+            except Exception as error:
+                elapsed = time.perf_counter()-start
+                check.update(status='failed',failed_case=name,error=f'{type(error).__name__}: {error}')
+                check['seconds'] += elapsed
+                self._persist(artifacts)
+                artifacts.log(f"{row['candidate_id']} case={name} FAIL after {elapsed:.3f}s: {error}",
+                              event='preflight_end')
+                raise
+            elapsed = time.perf_counter()-start
+            check['cases'].append({'name':name,'nodes':len(points),'seconds':elapsed})
+            check['seconds'] += elapsed
+            self._persist(artifacts)
+            artifacts.log(f"{row['candidate_id']} case={name} PASS in {elapsed:.3f}s; "
+                          'full deployment checks still required',event='preflight_end')
+        check['status'] = 'passed'
+        self._persist(artifacts)
+
     def _evaluate(self, artifacts: RunArtifacts, row: dict) -> dict:
+        row['evaluation_phase'] = 'source_validation'
         source_path = safe_child(artifacts.root,row['source_path'])
         source = source_path.read_text(encoding='utf-8')
         if hashlib.sha256(source.encode('utf-8')).hexdigest() != row['source_sha256']:
@@ -207,8 +255,11 @@ class SearchController:
         validate_candidate_source(source)
         if row['source_sha256'] in self.source_hashes:
             return {'status':'duplicate_source','feasible':False,'duplicate':True,'violations':[]}
+        self._preflight(artifacts,row,source_path)
         datasets = row.setdefault('completed_datasets',[])
         for record in self.bundle['datasets'][len(datasets):]:
+            row['evaluation_phase'] = 'dataset'
+            row['active_dataset'] = record['name']
             turbines = turbines_from_record(record)
             artifacts.log(f"{row['candidate_id']} dataset={record['name']} nodes={len(turbines)} start",event='dataset_start')
             start = time.perf_counter()
@@ -306,12 +357,13 @@ class SearchController:
             artifacts.write_json(f"evaluations/{row['index']:04d}.json",row)
         with (artifacts.root/'trajectory.csv').open('w',encoding='utf-8-sig',newline='') as handle:
             writer = csv.writer(handle)
-            writer.writerow(['candidate','parent','direction','feasible','reward','decision','objectives','llm_seconds','algorithm_seconds','evaluation_seconds'])
+            writer.writerow(['candidate','parent','direction','feasible','reward','decision','objectives','llm_seconds','algorithm_seconds','evaluation_seconds','preflight_seconds'])
             for row in self.history:
                 data = row['evaluation'].get('datasets',[])
                 writer.writerow([row['candidate_id'],row['parent_id'],row['direction_id'],row['evaluation']['feasible'],
                     row['reward'],row['decision'],row['objectives'],row.get('llm_seconds',0),
-                    sum(d['algorithm_seconds'] for d in data),sum(d['evaluation_seconds'] for d in data)])
+                    sum(d['algorithm_seconds'] for d in data),sum(d['evaluation_seconds'] for d in data),
+                    row.get('preflight',{}).get('seconds',0.0)])
 
     def run(self, run_id: str | None = None, resume: bool = False, reset_stall: bool = False) -> Path:
         self.bundle = prepare_data(self.settings)
@@ -387,8 +439,11 @@ class SearchController:
                     evaluation = self._evaluate(artifacts,row)
                 except Exception as error:
                     evaluation = {'status':'candidate_error','feasible':False,'datasets':row.get('completed_datasets',[]),
-                                  'violations':[f'{type(error).__name__}: {error}']}
-                    artifacts.log(f"{row['candidate_id']} candidate error: {error}",event='candidate_error')
+                                  'violations':[f'{type(error).__name__}: {error}'],
+                                  'failure_stage':row.get('evaluation_phase','unknown'),
+                                  'failed_dataset':row.get('active_dataset')}
+                    artifacts.log(f"{row['candidate_id']} phase={evaluation['failure_stage']} "
+                                  f"dataset={evaluation['failed_dataset']} candidate error: {error}",event='candidate_error')
                 self._finish(artifacts,row,evaluation)
         except (KeyboardInterrupt,MemoryError,OSError):
             self._persist(artifacts)
@@ -403,7 +458,15 @@ class SearchController:
             'global_optimality_proven':False,'origin':'offline_mock' if self.mock else 'llm',
             'active_search_seconds':self.elapsed_seconds+time.perf_counter()-self.active_start,
             'selection':'User must explicitly select a Pareto candidate; no implicit best algorithm.',
+            'generated_sources':sum(bool(row.get('source_path')) for row in self.history),
+            'preflight_passed':sum(row.get('preflight',{}).get('status') == 'passed' for row in self.history),
+            'fully_evaluated_candidates':sum(len(row['evaluation'].get('datasets',[])) == len(self.bundle['datasets'])
+                                             for row in self.history),
         })
         self._persist(artifacts)
+        if not self.archive and self.repair_pool and reason == 'budget_exhausted':
+            artifacts.log('No deployable candidate; failed source and diagnostics saved. Generation budget exhausted; '
+                          'no extra API call was made. Resume this NEW-version run with a larger budget to allow repair.',
+                          event='repair_budget_exhausted')
         artifacts.log(f'Search complete status={status} stop={reason} front={len(self.archive)} output={artifacts.root}',event='search_end')
         return artifacts.root

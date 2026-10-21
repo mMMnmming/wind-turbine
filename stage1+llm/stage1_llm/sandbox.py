@@ -15,7 +15,16 @@ def safe_import(name,globals=None,locals=None,fromlist=(),level=0):
 allowed["__import__"]=safe_import
 data=json.load(sys.stdin); scope={"__builtins__":allowed,"math":math,"random":random}
 exec(compile(data["source"],sys.argv[1],"exec"),scope,scope)
-T=lambda row: SimpleNamespace(identifier=row["identifier"],x_km=row["x_km"],y_km=row["y_km"])
+class TurbineInput(dict):
+    # Trusted input adapter, not generated code. Both public access styles read
+    # the same values; original domain objects stay in the parent process.
+    @property
+    def identifier(self): return self["identifier"]
+    @property
+    def x_km(self): return self["x_km"]
+    @property
+    def y_km(self): return self["y_km"]
+T=lambda row: TurbineInput(identifier=row["identifier"],x_km=row["x_km"],y_km=row["y_km"])
 C=SimpleNamespace(**data["config"])
 answer=scope["solve"]([T(t) for t in data["turbines"]],C,int(data["seed"]))
 if not isinstance(answer,dict) or set(answer)!={"nest_ids","assignments"}: raise ValueError("solve must return exactly nest_ids and assignments")

@@ -12,10 +12,10 @@
 | data_seed / validation_seed | 1234 / 1001234，不能重叠 |
 | deployment | 半径7km、速度23m/s、风速6m/s、续航2460秒、悬停10秒、能耗比1.14、罗盘风向90度 |
 | archive_size | 12，仅限制活跃父代池，不截断完整Pareto前沿 |
-| initial_candidates / evaluation_budget | 3 / 40，独立初始轮次/总逻辑轮次，生成失败计入预算 |
+| initial_candidates / evaluation_budget | 3 / 40，独立初始尝试/总逻辑轮次；无可部署方案且有失败源码时先修复，修复不占独立尝试计数，但占总预算 |
 | no_improvement_limit | 10，目标前沿无变化的停止轮数 |
 | seed | 1234，父代及方向选择种子，不保证远端LLM逐字可复现 |
-| candidate_timeout_seconds | 300，单候选单数据集的子进程墙钟超时 |
+| candidate_timeout_seconds | 300，单候选单真实数据集的子进程墙钟超时；1点/4点预检每项最多min(5,该值)秒 |
 | heartbeat_seconds | 10，LLM等待、算法和可信评估心跳间隔 |
 | show_code | true，流式显示公开正文，完成后打印带行号源码；`--no-show-code`关闭两者，不影响搜索评分 |
 | ucb_decay / ucb_exploration | 0.9 / 0.7，历史方向评分衰减及探索强度 |
