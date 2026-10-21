@@ -346,7 +346,7 @@ def main() -> int:
         parser.error("The legacy search does not consume references; use train or evaluate with --reference-results.")
     if args.mode == "search" and (args.output / "search").exists() and any((args.output / "search").iterdir()):
         parser.error("Search output already contains results. Use a new --output; existing trial files were not overwritten.")
-    virtual_fields = int(saved_config.get("virtual_fields", 256))
+    virtual_fields = int(saved_config.get("virtual_fields", 64))
     refresh_every = int(saved_config.get("refresh_every_epochs", 0))
     refresh_fields = int(saved_config.get("refresh_fields", 0))
     if args.mode in ("train", "resume"):

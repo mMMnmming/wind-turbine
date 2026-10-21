@@ -24,15 +24,19 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 
 | 参数 | 默认值 | 含义 |
 |---|---:|---|
-| `virtual_fields` | 256 | 初始 KDE 风场数，每场仍由原 Stage1 分区 |
+| `learning_rate` | 0.0001 | 本次旧版固定数据搜索选出的学习率 |
+| `virtual_fields` | 64 | 本次搜索选出的初始 KDE 风场数，每场仍由原 Stage1 分区 |
+| `energy_weight` | 0.25 | 本次搜索选出的能耗权重 |
 | `validation_fields` | 16 | 固定验证风场数，不随训练刷新 |
 | `data_seed` | 1234 | 数据生成与刷新种子，独立于策略训练种子 |
 | `seed` | 1234 | 网络初始化、路线采样、batch 抽样种子 |
 | `refresh_every_epochs` | 5 | 在第 6、11、16…轮开始前刷新 |
-| `refresh_fields` | 64 | 每次替换最旧的 64 个完整虚拟风场，真实分区不移除 |
+| `refresh_fields` | 16 | 每次替换最旧的 16 个完整虚拟风场，真实分区不移除 |
 | `stratified_sampling` | true | 按每 10 个待巡检节点的规模桶均衡抽样，不复制同图 |
 
-上述数量/刷新策略是待验证的工程设定，不是论文原始超参数。固定同源 KDE 验证只能衡量同分布泛化，不能代替分布外测试。当前阵风仍是固定 12 m/s 输入，不是动态阵风仿真。
+学习率/初始风场数/能耗权重采用本次搜索胜出值，但不保证在刷新训练中仍然最优。刷新量随初始池从 256 场调整到 64 场而由 64 改为 16，保留每次替换 25% 的节奏；16 不是搜索得出的参数。刷新与分层抽样仍是工程设定，不是论文原始超参数。固定同源 KDE 验证只能衡量同分布泛化，不能代替分布外测试。当前阵风仍是固定 12 m/s 输入，不是动态阵风仿真。
+
+默认训练种子仍为 1234，数据种子仍为 1234。搜索中最终保留模型来自种子 1236，不代表 1236 是普遍最佳的超参数；若想用该种子重新训练，可加 `--seed 1236`，不要因此改动 `--data-seed`。若要按旧搜索的固定数据条件复跑，另加 `--refresh-every-epochs 0 --no-stratified-sampling`；新代码修复等差异仍可能影响结果。
 
 ### 服务器一条命令后台训练（日期日志）
 
@@ -42,7 +46,7 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 mkdir -p stage2/outputs/round1 && nohup python -u -m stage2.run train --output stage2/outputs/round1 > "stage2/outputs/round1/$(date +%Y%m%d_%H%M%S).log" 2>&1 < /dev/null &
 ```
 
-首次自动准备 256+16 个风场，再训练 100 epoch。数据准备也在后台，日志会显示进度；不要将此前旧实验的目录当作 `round1`。训练不需要安装 Gurobi，不会自动测试 87，也不会自动执行 21 次超参数搜索。可用 `tail -f stage2/outputs/round1/具体日期.log` 查看进度。不要同时向同一训练输出目录启动多个任务。
+首次自动准备 64+16 个风场，再训练 100 epoch。数据准备也在后台，日志会显示进度；不要将此前旧实验（尤其 256 场缓存）的目录当作新的 `round1`。训练不需要安装 Gurobi，不会自动测试 87，也不会自动执行 21 次超参数搜索。可用 `tail -f stage2/outputs/round1/具体日期.log` 查看进度。不要同时向同一训练输出目录启动多个任务。
 
 正式训练前可先做一次很小的 CUDA 流程检查（不代表模型质量）：
 
@@ -60,7 +64,7 @@ python -m stage2.run train --output stage2/outputs/round1_smoke --virtual-fields
 python -m stage2.run train --virtual-fields 32 --refresh-every-epochs 0 --no-stratified-sampling --output stage2/outputs/baseline32
 ```
 
-也可以保留 256 场而只加 `--refresh-every-epochs 0`，单独比较刷新作用。以上对照使用相同 `data_seed` 和验证场数，验证拓扑相同。建议逐项修改，而不是把数据量、抽样和训练预算一起改变后归因于单一因素。
+也可以保留默认 64 场而只加 `--refresh-every-epochs 0`，单独比较刷新作用。以上对照使用相同 `data_seed` 和验证场数，验证拓扑相同。建议逐项修改，而不是把数据量、抽样和训练预算一起改变后归因于单一因素。
 
 多种子复跑可复用已经准备的数据（先等首次准备完成），只修改 `--seed`，不修改 `--data-seed`：
 
@@ -151,7 +155,7 @@ python -m stage2.run train \
 
 每个训练 batch 由不同区域/随机拓扑组成，变长图通过 padding 和有效节点掩码处理；若实例少于请求 batch size，则使用所有不同实例，不重复复制图。动作掩码仅排除机巢和已访问节点，完整巡检后隐式返回机巢；路线若超出续航，以大额安全惩罚处理。每个 epoch 在固定验证集贪心评估，优先按可行率、再按归一化飞行时间选 `best.pt`。`latest.pt` 用于续训，`best.pt` 用于评估。
 
-奖励是归一化航程/飞行时间成本（权重 1）、归一化能耗成本（初始权重 0.5）、可行完整巡检终端奖励（+5）、续航违规惩罚（−20，另加超限惩罚）。这些是工程起点，不是论文公布的精确系数。可通过 config 或命令行覆盖训练超参数；当前支持 `--learning-rate`、`--energy-weight`、`--virtual-fields`、`--epochs`、`--batch-size` 和 `--batches-per-epoch`。
+奖励是归一化航程/飞行时间成本（权重 1）、归一化能耗成本（默认权重 0.25）、可行完整巡检终端奖励（+5）、续航违规惩罚（−20，另加超限惩罚）。能耗权重采用本次搜索胜出值；其余系数仍是工程设定，不是论文公布的精确原值。可通过 config 或命令行覆盖训练超参数；当前支持 `--learning-rate`、`--energy-weight`、`--virtual-fields`、`--epochs`、`--batch-size` 和 `--batches-per-epoch`。
 
 续训示例（`--epochs` 是最终总 epoch 数）：
 
@@ -172,7 +176,7 @@ python -m stage2.run search \
 
 搜索网格为学习率 `{3e-5, 1e-4, 3e-4}` × KDE 训练场数 `{32,64}` × 能耗权重 `{0.25,0.5}`，共 12 组。验证排名前三的配置再各用 3 个种子复跑，按三种子平均可行率及平均归一化飞行时间选最终 checkpoint。所有尝试保存在 `search/` 下，汇总为 `search/search_results.json`，最终模型为 `search/final/best.pt`。完整搜索约训练 21 次完整模型，计算量显著高于单次训练；调试时可用较小的 `--epochs`、`--batches-per-epoch` 和 `--batch-size`。
 
-这是保留的旧版固定数据搜索入口，会显式关闭刷新与分层抽样，也不接收 `--reference-results`。请使用独立的新输出/数据目录；不能将 256 场缓存作为旧搜索的 64 场缓存复用。本轮推荐先运行上面的单配置对照，不默认启动这项昂贵搜索。
+这是保留的旧版固定数据搜索入口，会显式关闭刷新与分层抽样，也不接收 `--reference-results`。请使用独立的新输出目录；复用数据缓存时，场数、种子和源文件等设定必须一致，不能将旧 256 场缓存作为 64 场缓存使用。本轮推荐先运行上面的单配置对照，不默认启动这项昂贵搜索。
 
 ## 87 数据集最终评估
 

@@ -14,6 +14,34 @@ from stage2.run import ROOT, _resolve_input_path, _run_search, main
 
 
 class RunCliTests(unittest.TestCase):
+    def test_default_configuration_uses_selected_search_parameters(self) -> None:
+        from stage2.train import TrainingConfig
+
+        config = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            {name: config[name] for name in ("learning_rate", "virtual_fields", "energy_weight")},
+            {"learning_rate": 1e-4, "virtual_fields": 64, "energy_weight": 0.25},
+        )
+        self.assertEqual(TrainingConfig().learning_rate, config["learning_rate"])
+        self.assertEqual(TrainingConfig().energy_weight, config["energy_weight"])
+        self.assertEqual(config["refresh_fields"], config["virtual_fields"] // 4)
+        self.assertEqual(config["refresh_every_epochs"], 5)
+        self.assertEqual((config["seed"], config["data_seed"]), (1234, 1234))
+
+    def test_missing_virtual_field_setting_falls_back_to_sixty_four(self) -> None:
+        from stage2.tests.test_pool import small_instance
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.json"
+            config.write_text(json.dumps({"device": "cpu", "seed": 1234}), encoding="utf-8")
+            manifest = {"input_hashes": {}, "kde_generation": {"attempts_by_split": {}}}
+            with patch("stage2.run._prepare_or_load_dataset",
+                       return_value=([small_instance("train", 0.0)], [small_instance("val", 10.0)], manifest)) as prepare, \
+                    patch("sys.argv", ["stage2.run", "prepare_data", "--config", str(config), "--output", str(root)]):
+                self.assertEqual(main(), 0)
+            self.assertEqual(prepare.call_args.args[4], 64)
+
     def test_training_and_evaluation_default_to_separate_datasets(self) -> None:
         self.assertEqual(_resolve_input_path("train", None), ROOT.parent / "turbine102.tsv")
         self.assertEqual(_resolve_input_path("evaluate", None), ROOT.parent / "turbine87.tsv")

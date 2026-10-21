@@ -32,7 +32,7 @@ class TrainingConfig:
     learning_rate: float = 1e-4
     gradient_clip_norm: float = 1.0
     distance_weight: float = 1.0
-    energy_weight: float = 0.5
+    energy_weight: float = 0.25
     completion_bonus: float = 5.0
     safety_penalty: float = 20.0
     safety_overshoot_penalty: float = 10.0
