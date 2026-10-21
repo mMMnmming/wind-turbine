@@ -1,0 +1,14 @@
+[run]
+source = stage1+llm/stage1_llm
+data_file = stage1+llm/outputs/.coverage
+branch = True
+
+[report]
+show_missing = True
+fail_under = 80
+omit =
+    */templates.py
+    */plotting.py
+
+[html]
+directory = stage1+llm/outputs/coverage-html

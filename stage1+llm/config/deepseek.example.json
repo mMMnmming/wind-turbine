@@ -1,0 +1,9 @@
+{
+  "base_url": "https://api.deepseek.com",
+  "model": "deepseek-flash",
+  "api_key": "PUT_YOUR_KEY_IN_deepseek.local.json",
+  "temperature": 0.2,
+  "timeout_seconds": 180,
+  "retries": 3,
+  "max_tokens": 10000
+}
