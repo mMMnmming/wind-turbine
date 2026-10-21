@@ -8,14 +8,17 @@ import hashlib
 import itertools
 import json
 import logging
+import math
 from pathlib import Path
 import shutil
+import time
 
 from .data import (
     KDE_RETRY_SEED_STRIDE,
     build_deployment_instances,
     build_training_validation_instances,
     instance_to_record,
+    instance_fingerprint,
     load_region_instances,
     split_fingerprint,
 )
@@ -409,6 +412,56 @@ def main() -> int:
     return 0
 
 
+def _timed_greedy_route(model: object, features: object) -> tuple[tuple[int, ...], float]:
+    """Time one existing greedy decode and host transfer, not feature creation."""
+    import torch
+
+    if features.device.type == "cuda":
+        torch.cuda.synchronize(features.device)
+    started = time.perf_counter()
+    with torch.no_grad():
+        order, _ = model(features, decode_type="greedy")
+        route = (0, *(int(index) for index in order[0].cpu().tolist()), 0)
+    if features.device.type == "cuda":
+        torch.cuda.synchronize(features.device)
+    return route, time.perf_counter() - started
+
+
+def _resolve_evaluation_environment(
+    instances: list[object], trained_environment: dict, *, frozen_input: bool,
+) -> list[object]:
+    """Explicit region inputs are authoritative, never silently rewritten."""
+    from dataclasses import replace
+    from .atsp import WindATSPConfig
+
+    if not trained_environment:
+        if frozen_input:
+            logging.getLogger(__name__).warning(
+                "Checkpoint lacks wind environment metadata; evaluating the explicit frozen input unchanged.")
+        return instances
+    environment = WindATSPConfig(**trained_environment)
+    if frozen_input:
+        if any(asdict(instance.config) != asdict(environment) for instance in instances):
+            raise ValueError("Checkpoint environment differs from frozen regions. Input wind/endurance was not overridden; use a matching checkpoint or a separately defined experiment.")
+        return instances
+    return [replace(instance, config=environment) for instance in instances]
+
+
+def _model_totals(records: list[dict], expected_count: int) -> dict:
+    """Report all measured tours, explicitly including infeasible model routes."""
+    feasible = sum(bool(record["feasible"]) for record in records)
+    return {
+        "region_count": expected_count, "reported_count": len(records), "route_region_count": len(records),
+        "total_flight_seconds": math.fsum(record["flight_seconds"] for record in records) if len(records) == expected_count else None,
+        "available_flight_seconds": math.fsum(record["flight_seconds"] for record in records),
+        "total_runtime_seconds": math.fsum(record["runtime_seconds"] for record in records),
+        "feasible_region_count": feasible, "infeasible_region_count": len(records) - feasible,
+        "all_routes_feasible": feasible == expected_count,
+        "flight_total_complete": len(records) == expected_count,
+        "flight_total_note": "All measured model tours, including unsafe routes; not the valid-gap subset.",
+    }
+
+
 def _evaluate(args: argparse.Namespace, parser: argparse.ArgumentParser, instances: list[object], device: str) -> int:
     import torch
 
@@ -416,23 +469,21 @@ def _evaluate(args: argparse.Namespace, parser: argparse.ArgumentParser, instanc
     from .evaluation import evaluate_route, nearest_neighbor_route, random_route_summary, write_evaluation_artifacts
     from .model import GraphPointerNetwork, make_node_features
 
+    source_name = (args.regions_json or args.input).stem
+    evaluation_output = args.evaluation_output or args.output / "evaluations" / f"{source_name}_{args.checkpoint.stem}"
+    if any((evaluation_output / name).exists() for name in ("data_manifest.json", "reference_results.json")):
+        parser.error("Evaluation output must be separate from immutable training/reference data.")
     payload = torch.load(args.checkpoint, map_location=device, weights_only=False)
     config = payload["training_config"]
     trained_environment = payload.get("wind_environment", {})
-    if trained_environment:
-        from dataclasses import replace
-        from .atsp import WindATSPConfig
-
-        instances = [
-            replace(instance, config=WindATSPConfig(**trained_environment))
-            for instance in instances
-        ]
+    instances = _resolve_evaluation_environment(instances, trained_environment, frozen_input=args.regions_json is not None)
     from .benchmark import load_references, reference_summary
     references = load_references(args.reference_results, instances) if args.reference_results else None
     model = GraphPointerNetwork(config["hidden_dim"], config["encoder_layers"], config["heads"]).to(device)
     model.load_state_dict(payload["model"])
     model.eval()
     evaluations = []
+    model_metrics = []
     for region, instance in enumerate(instances, start=1):
         coordinates = torch.tensor(instance.coordinates_km, dtype=torch.float32, device=device).unsqueeze(0)
         features = make_node_features(
@@ -441,34 +492,45 @@ def _evaluate(args: argparse.Namespace, parser: argparse.ArgumentParser, instanc
             instance.config.wind_direction_degrees,
             instance.config.gust_speed_mps,
         )
-        with torch.no_grad():
-            order, _ = model(features, decode_type="greedy")
-        route = (0, *(int(index) for index in order[0].cpu().tolist()), 0)
+        if instance.node_count == 1:
+            route, inference_seconds = (0, 0), 0.0
+        else:
+            route, inference_seconds = _timed_greedy_route(model, features)
         model_report = evaluate_route(instance, "model_greedy", route)
+        model_metrics.append({
+            "region": region, "nest_id": instance.identifiers[instance.depot_index],
+            "node_count": instance.node_count, "instance_fingerprint": instance_fingerprint(instance),
+            "instance": instance_to_record(instance), "route": list(route),
+            "flight_seconds": model_report.flight_seconds, "runtime_seconds": inference_seconds,
+            "equivalent_energy_seconds": model_report.equivalent_energy_seconds, "feasible": model_report.feasible,
+        })
         nearest_report = evaluate_route(instance, "nearest_neighbor", nearest_neighbor_route(instance))
         random_report = random_route_summary(instance, args.random_samples, args.evaluation_seed + region - 1)
         evaluations.append((region, instance, model_report, nearest_report, random_report))
         print(
             f"Region {region:02d} | nest={instance.identifiers[0]} | nodes={instance.node_count} | "
-            f"model={model_report.equivalent_energy_seconds:.2f}s ({model_report.feasible}) | "
-            f"nearest={nearest_report.equivalent_energy_seconds:.2f}s ({nearest_report.feasible}) | "
+            f"model flight={model_report.flight_seconds:.2f}s | inference={inference_seconds:.6f}s | "
+            f"feasible={model_report.feasible} | nearest flight={nearest_report.flight_seconds:.2f}s | "
             f"random feasible={random_report.feasible_count}/{random_report.sample_count}", flush=True,
         )
-    source_name = (args.regions_json or args.input).stem
-    evaluation_output = args.evaluation_output or args.output / "evaluations" / f"{source_name}_{args.checkpoint.stem}"
-    if (evaluation_output / "data_manifest.json").exists():
-        parser.error("Evaluation output must be separate from immutable prepared data.")
     input_hashes = {
         "test_input_sha256": hashlib.sha256((args.regions_json or args.input).read_bytes()).hexdigest(),
         "stage1_config_sha256": hashlib.sha256(args.stage1_config.read_bytes()).hexdigest(),
         "checkpoint_sha256": hashlib.sha256(args.checkpoint.read_bytes()).hexdigest(),
     }
+    service_radius = load_config(args.stage1_config).communication_radius_km
+    if args.regions_json:
+        source_payload = json.loads(args.regions_json.read_text(encoding="utf-8"))
+        if isinstance(source_payload, dict) and source_payload.get("frozen_reference"):
+            service_radius = float(source_payload["source"]["communication_radius_km"])
+            if not math.isfinite(service_radius) or service_radius <= 0:
+                raise ValueError("Frozen service radius must be finite and positive.")
     write_evaluation_artifacts(
         output=evaluation_output,
         evaluations=evaluations,
         checkpoint_path=args.checkpoint,
         input_hashes=input_hashes,
-        service_radius_km=load_config(args.stage1_config).communication_radius_km,
+        service_radius_km=service_radius,
         plot_dpi=args.plot_dpi,
     )
     summary_path = evaluation_output / "evaluation_summary.json"
@@ -489,11 +551,26 @@ def _evaluate(args: argparse.Namespace, parser: argparse.ArgumentParser, instanc
         if isinstance(source_payload, dict) and source_payload.get("split") in ("training", "validation"):
             split_name = source_payload["split"]
     summary["evaluation_split"] = split_name
+    totals = _model_totals(model_metrics, len(instances))
+    summary["model_totals"] = totals
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     (evaluation_output / f"{split_name}_regions.json").write_text(
         json.dumps({"split": split_name, "regions": _instances_as_dict(instances)}, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    metrics_path = evaluation_output / "model_metrics.json"
+    temporary = metrics_path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps({
+        "schema_version": 1, "method": "model_greedy", "checkpoint": str(args.checkpoint),
+        "checkpoint_sha256": input_hashes["checkpoint_sha256"], "device": str(device),
+        "evaluation_split": split_name,
+        "summary": totals, "split_fingerprint": split_fingerprint(instances),
+        "timing_scope": "One greedy forward/decode and route transfer to host, synchronized on CUDA; excludes model loading, features, baselines, plotting and file I/O; no warm-up or repeats.",
+        "results": model_metrics,
+    }, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    temporary.replace(metrics_path)
+    print(f"Model totals | regions={len(instances)} | flight={totals['total_flight_seconds']:.6f}s | "
+          f"inference={totals['total_runtime_seconds']:.6f}s | infeasible={totals['infeasible_region_count']}", flush=True)
     print(f"Evaluated {len(instances)} routing regions. Results: {evaluation_output}")
     return 0
 

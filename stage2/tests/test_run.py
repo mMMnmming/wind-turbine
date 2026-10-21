@@ -14,6 +14,82 @@ from stage2.run import ROOT, _resolve_input_path, _run_search, main
 
 
 class RunCliTests(unittest.TestCase):
+    def test_explicit_regions_keep_their_environment_and_reject_checkpoint_override(self) -> None:
+        from dataclasses import asdict
+        from stage2.tests.test_pool import small_instance
+        from stage2.run import _resolve_evaluation_environment
+
+        instance = small_instance("D", 0)
+        saved = asdict(instance.config)
+        self.assertIs(_resolve_evaluation_environment([instance], saved, frozen_input=True)[0], instance)
+        wrong = {**saved, "wind_speed_mps": 3.0}
+        with self.assertRaises(ValueError):
+            _resolve_evaluation_environment([instance], wrong, frozen_input=True)
+        updated = _resolve_evaluation_environment([instance], wrong, frozen_input=False)
+        self.assertEqual(updated[0].config.wind_speed_mps, 3)
+        with self.assertLogs("stage2.run", level="WARNING"):
+            self.assertIs(_resolve_evaluation_environment([instance], {}, frozen_input=True)[0], instance)
+
+    def test_raw_model_totals_include_unsafe_routes(self) -> None:
+        from stage2.run import _model_totals
+
+        records = [{"flight_seconds": 100.0, "runtime_seconds": 0.01, "feasible": True},
+                   {"flight_seconds": 3000.0, "runtime_seconds": 0.02, "feasible": False}]
+        totals = _model_totals(records, 2)
+        self.assertEqual(totals["total_flight_seconds"], 3100)
+        self.assertAlmostEqual(totals["total_runtime_seconds"], 0.03)
+        self.assertEqual(totals["infeasible_region_count"], 1)
+        self.assertFalse(totals["all_routes_feasible"])
+        self.assertIsNone(_model_totals(records[:1], 2)["total_flight_seconds"])
+
+    def test_zero_task_frozen_region_needs_no_network_forward(self) -> None:
+        from dataclasses import asdict
+        import torch
+        from stage2.atsp import WindATSPConfig, WindATSPInstance
+        from stage2.data import instance_to_record
+        from stage2.model import GraphPointerNetwork
+        import numpy as np
+
+        instance = WindATSPInstance(("D",), np.zeros((1, 2)), 0, WindATSPConfig())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "regions.json"
+            source.write_text(json.dumps({"frozen_reference": True, "source": {"communication_radius_km": 3},
+                                          "regions": [instance_to_record(instance)]}))
+            checkpoint = root / "best.pt"
+            model = GraphPointerNetwork(8, 1, 2)
+            torch.save({"training_config": {"hidden_dim": 8, "encoder_layers": 1, "heads": 2},
+                        "model": model.state_dict(), "wind_environment": asdict(instance.config)}, checkpoint)
+            from stage2.evaluation import write_evaluation_artifacts
+            with patch("sys.argv", ["stage2.run", "evaluate", "--device", "cpu", "--regions-json", str(source),
+                                    "--checkpoint", str(checkpoint), "--evaluation-output", str(root / "evaluation"),
+                                    "--random-samples", "1", "--plot-dpi", "40"]), \
+                    patch("stage2.run._timed_greedy_route", side_effect=AssertionError("No tasks")), \
+                    patch("stage2.evaluation.write_evaluation_artifacts", wraps=write_evaluation_artifacts) as artifacts:
+                self.assertEqual(main(), 0)
+            metrics = json.loads((root / "evaluation/model_metrics.json").read_text())
+            self.assertEqual(metrics["summary"]["total_flight_seconds"], 0)
+            self.assertEqual(metrics["summary"]["total_runtime_seconds"], 0)
+            self.assertEqual(artifacts.call_args.kwargs["service_radius_km"], 3)
+
+    def test_inference_timer_synchronizes_cuda_and_includes_host_transfer(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from stage2.run import _timed_greedy_route
+
+        events = []
+        features = SimpleNamespace(device=SimpleNamespace(type="cuda"))
+        row = Mock()
+        row.cpu.side_effect = lambda: events.append("transfer") or row
+        row.tolist.return_value = [2, 1]
+        model = Mock(side_effect=lambda *args, **kwargs: events.append("forward") or ([row], None))
+        with patch("torch.cuda.synchronize", side_effect=lambda *args: events.append("sync")), \
+                patch("stage2.run.time.perf_counter", side_effect=lambda: events.append("clock") or len(events)):
+            route, runtime = _timed_greedy_route(model, features)
+        self.assertEqual(route, (0, 2, 1, 0))
+        self.assertGreater(runtime, 0)
+        self.assertEqual(events, ["sync", "clock", "forward", "transfer", "sync", "clock"])
+
     def test_default_configuration_uses_selected_search_parameters(self) -> None:
         from stage2.train import TrainingConfig
 
@@ -132,6 +208,18 @@ class RunCliTests(unittest.TestCase):
             summary = json.loads((root / "evaluation/evaluation_summary.json").read_text())
             self.assertEqual(summary["evaluation_split"], "validation")
             self.assertEqual(summary["reference_comparison"]["optimality_gap_count"], 1.0)
+            timing = json.loads((root / "evaluation/model_metrics.json").read_text())
+            self.assertEqual(timing["device"], "cpu")
+            self.assertEqual(len(timing["results"]), 1)
+            self.assertGreater(timing["results"][0]["runtime_seconds"], 0)
+            self.assertAlmostEqual(timing["summary"]["total_flight_seconds"],
+                                   sum(row["flight_seconds"] for row in timing["results"]))
+            self.assertAlmostEqual(timing["summary"]["total_runtime_seconds"],
+                                   sum(row["runtime_seconds"] for row in timing["results"]))
+            self.assertEqual(timing["summary"]["region_count"], 1)
+            self.assertIn("instance_fingerprint", timing["results"][0])
+            self.assertAlmostEqual(timing["results"][0]["flight_seconds"],
+                                   summary["method_summary"]["model_greedy"]["mean_flight_seconds"])
             self.assertEqual(original, source.read_bytes())
             with patch("sys.argv", [*evaluate, "--evaluation-output", str(root / "data")]), redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
