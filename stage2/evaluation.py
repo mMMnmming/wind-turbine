@@ -14,7 +14,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.patches import Circle, FancyArrowPatch
+from .route_plotting import draw_energy_route
 import numpy as np
 
 from .atsp import WindATSPInstance
@@ -192,37 +192,18 @@ def _configure_plot_style() -> None:
 
 
 def _draw_route(ax: plt.Axes, instance: WindATSPInstance, report: RouteReport, service_radius_km: float) -> None:
-    coordinates = instance.coordinates_km
-    depot = instance.depot_index
-    ax.scatter(coordinates[:, 0], coordinates[:, 1], c="darkblue", s=30, label="Wind Turbines", zorder=3)
-    ax.scatter(
-        coordinates[depot, 0], coordinates[depot, 1], c="red", s=30, marker="s", edgecolors="black",
-        linewidths=1.5, label="UAV Nest", zorder=5,
-    )
-    ax.add_patch(Circle(tuple(coordinates[depot]), service_radius_km, color="blue", alpha=0.5, fill=False))
-    for first, second in zip(report.route_indices, report.route_indices[1:]):
-        ax.add_patch(
-            FancyArrowPatch(
-                coordinates[first], coordinates[second], arrowstyle="->", mutation_scale=9,
-                linewidth=1.15, color="dimgray", alpha=0.9, zorder=2,
-            )
-        )
-    label = "Network Best-of-" + report.method.removeprefix("model_best_of_") if report.method.startswith("model_best_of_") else "Greedy Route"
-    ax.plot([], [], color="dimgray", linewidth=1.15, label=label)
-    padding = 0.5
-    ax.set_xlim(coordinates[:, 0].min() - padding, coordinates[:, 0].max() + padding)
-    ax.set_ylim(coordinates[:, 1].min() - padding, coordinates[:, 1].max() + padding)
-    ax.set_xlabel("X Coordinate (km)", labelpad=10)
-    ax.set_ylabel("Y Coordinate (km)", labelpad=10)
-    ax.grid(True, linestyle="--", alpha=0.6)
-    ax.axis("equal")
+    # service_radius_km remains an API compatibility argument, not route artwork.
+    label = ("Network Best-of-" + report.method.removeprefix("model_best_of_")
+             if report.method.startswith("model_best_of_") else
+             {"model_greedy": "Network greedy", "nearest_neighbor": "Nearest neighbour"}.get(report.method, report.method))
+    draw_energy_route(ax, instance, report.route_indices, label)
 
 
 def _write_region_figure(path: Path, instance: WindATSPInstance, report: RouteReport, service_radius_km: float, dpi: int) -> None:
     _configure_plot_style()
     fig, ax = plt.subplots(figsize=(6, 7.5))
     _draw_route(ax, instance, report, service_radius_km)
-    ax.legend(fontsize=16, loc="upper right", bbox_to_anchor=(1.0, 1.0), borderaxespad=0.5)
+    ax.legend(fontsize=8, loc="lower center", bbox_to_anchor=(0.5, 1.02), ncol=3)
     fig.tight_layout(pad=1.5)
     fig.subplots_adjust(left=0.15, bottom=0.15, right=0.9, top=0.9)
     fig.savefig(path, dpi=dpi, bbox_inches="tight")
@@ -239,8 +220,8 @@ def _write_overview(path: Path, evaluations: list[tuple[int, WindATSPInstance, R
     for ax in axes.flat[len(evaluations):]:
         ax.set_visible(False)
     handles, labels = axes.flat[0].get_legend_handles_labels()
-    fig.legend(handles, labels, fontsize=16, loc="upper right", bbox_to_anchor=(0.98, 0.98))
-    fig.tight_layout(pad=2.0)
+    fig.legend(handles, labels, fontsize=10, loc="upper center", ncol=3, bbox_to_anchor=(0.5, 0.99))
+    fig.tight_layout(pad=2.0, rect=(0, 0, 1, 0.96))
     fig.savefig(path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
 

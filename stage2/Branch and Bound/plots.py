@@ -8,9 +8,9 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.patches import FancyArrowPatch
 
 from stage2.atsp import WindATSPInstance
+from stage2.route_plotting import draw_energy_route
 
 
 def route_status(record: dict) -> str:
@@ -23,31 +23,23 @@ def _draw(ax: plt.Axes, region: int, instance: WindATSPInstance, record: dict) -
     coordinates = instance.coordinates_km
     depot = instance.depot_index
     clients = [i for i in range(instance.node_count) if i != depot]
-    ax.scatter(coordinates[clients, 0], coordinates[clients, 1], s=28, color="tab:blue", label="Inspection turbines")
-    ax.scatter(*coordinates[depot], s=65, marker="s", color="tab:red", label="UAV nest", zorder=5)
-    for index, identifier in enumerate(instance.identifiers):
-        ax.annotate(f"{index}: {identifier}", coordinates[index], xytext=(4, 4), textcoords="offset points", fontsize=7)
     status = route_status(record)
     route = record.get("route")
     if route is not None:
-        instance.evaluate_route(tuple(route))
-        for first, second in zip(route, route[1:]):
-            if first != second:
-                ax.add_patch(FancyArrowPatch(coordinates[first], coordinates[second], arrowstyle="->",
-                                            mutation_scale=10, color="dimgray", linewidth=1.1,
-                                            linestyle="-" if status == "optimal" else "--"))
         label = "Branch and Bound optimum" if status == "optimal" else "Best known (not proven optimal)"
-        ax.plot([], [], color="dimgray", linestyle="-" if status == "optimal" else "--", label=label)
+        draw_energy_route(ax, instance, tuple(route), label, linestyle="-" if status == "optimal" else "--")
     else:
+        ax.scatter(coordinates[clients, 0], coordinates[clients, 1], s=28, color="tab:blue", label="Inspection turbines")
+        ax.scatter(*coordinates[depot], s=65, marker="s", color="tab:red", label="UAV nest", zorder=5)
         ax.text(0.5, 0.5, "No feasible route obtained", transform=ax.transAxes, ha="center")
+        ax.set_xlabel("X coordinate (km)")
+        ax.set_ylabel("Y coordinate (km)")
+        ax.set_aspect("equal", adjustable="box")
+        ax.margins(0.12)
+        ax.grid(True, alpha=0.25)
     flight = record.get("flight_seconds")
     cost = f"{flight:.3f} s" if flight is not None else "N/A"
     ax.set_title(f"Region {region:02d} | {record.get('termination', 'PENDING')}\nFlight: {cost}")
-    ax.set_xlabel("X coordinate (km)")
-    ax.set_ylabel("Y coordinate (km)")
-    ax.set_aspect("equal", adjustable="datalim")
-    ax.margins(0.12)
-    ax.grid(True, alpha=0.25)
     ax.legend(fontsize=7, loc="best")
 
 
