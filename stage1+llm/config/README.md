@@ -1,4 +1,10 @@
-# v3 配置
+# v4 默认与 v3 兼容配置
+
+CLI现默认使用 `search-v4.json`，不是下面保留的 `search.json`。v4与v3配置都可加载，但新实现不能直接恢复旧实验。
+
+v4新增：`selector=sliding_window`、`ucb_window=32`、`constraint_preflight=true`、`early_rejection=true`、`soft_seconds=120`、`max_region_evaluations=5000`、`max_move_attempts=20000`、`feedback_dataset_limit=4`。硬超时300秒、探索系数0.7，预检自动缩短软预算。此为待验证工程初值，不是论文设置。默认数据目录prepared-v4，仍为102＋8训练KDE＋8验证KDE。工作预算、选择器、预检设置全部属于恢复身份，不允许在旧run里更换。
+
+显式读取旧配置可用 `--search-config "stage1+llm/config/search.json"`；其新增开关采用兼容缺省值（旧discounted选择器、不启用约束反例/提前拒绝），不表示已回到旧版本程序。以下保留v3配置项和API配置说明。
 
 `search.json` 的相对路径从仓库根目录解析。真实密钥只填本机 `deepseek.local.json`，不要修改公开示例放密钥；私密文件不会随Git同步。模型ID须按账号实际可用值填写，离线测试不会核验供应商模型。
 
