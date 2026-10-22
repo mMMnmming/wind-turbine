@@ -40,8 +40,9 @@ def evaluate_edge_policy(model: torch.nn.Module, instances: list[WindATSPInstanc
     for instance in instances:
         selected = infer_instance(model, instance, device, config.decode_strategy,
                                   config.decode_samples, config.decode_chunk_size, config.evaluation_seed)
-        auxiliary = infer_instance(model, instance, device, "greedy", 1,
-                                   config.decode_chunk_size, config.evaluation_seed)
+        auxiliary = (selected if config.decode_strategy == "greedy" else
+                     infer_instance(model, instance, device, "greedy", 1,
+                                    config.decode_chunk_size, config.evaluation_seed))
         result, single = selected["metrics"], auxiliary["metrics"]
         limit = instance.config.max_endurance_seconds
         main.append((float(result.feasible), result.flight_seconds / limit))
@@ -75,6 +76,15 @@ def evaluate_edge_policy(model: torch.nn.Module, instances: list[WindATSPInstanc
         report[f"{prefix}_count"] = len(entries)
         report[f"{prefix}_feasible_rate"] = float(np.mean([row[0] for row in entries]))
         report[f"{prefix}_normalized_flight_cost"] = float(np.mean([row[1] for row in entries]))
+    report["total_flight_seconds"] = sum(row[1] for row in predictions)
+    report["size_groups"] = {
+        str(bucket): {"count": len(entries),
+                      "feasible_rate": float(np.mean([row[0] for row in entries])),
+                      "mean_normalized_flight_cost": float(np.mean([row[1] for row in entries])),
+                      "total_flight_seconds": sum(predictions[i][1] for i, instance in enumerate(instances)
+                                                  if max(instance.node_count - 2, 0) // 10 == bucket)}
+        for bucket, entries in buckets.items()
+    }
     if references is not None:
         from .benchmark import reference_summary
         report.update(reference_summary(predictions, references))

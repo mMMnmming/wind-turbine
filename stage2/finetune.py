@@ -95,7 +95,7 @@ def _materialize_best(state: dict, output: Path) -> None:
             selection_rule=f"{kind}_feasible_rate_then_normalized_flight_cost",
         )
         _save_checkpoint(payload, output / f"best_{kind}.pt")
-        if kind == "sampling":
+        if kind == "sampling" or set(state["best_models"]) == {"greedy"}:
             _save_checkpoint(payload, output / "best.pt")
 
 
@@ -112,6 +112,7 @@ def _run_arm(
     end: float,
     resume: bool,
     references: dict | None,
+    greedy_only: bool = False,
 ) -> dict:
     if pool is not None:
         pool.load_state_dict(parent["training_pool"])
@@ -169,7 +170,11 @@ def _run_arm(
             "validation": baseline,
             "training_pool": pool.state_dict() if pool else None,
         }
-        best_models = {"sampling": snapshot, "greedy": snapshot}
+        best_models = (
+            {"greedy": snapshot}
+            if greedy_only
+            else {"sampling": snapshot, "greedy": snapshot}
+        )
         history, first_epoch = [], 0
         state = {
             "architecture": EDGE_V2,
@@ -253,6 +258,32 @@ def _run_arm(
             loss, policy, bonus = reinforce_entropy_loss(
                 advantage, logp.reshape(-1, k), details["entropy"], beta
             )
+            if greedy_only and arm == "reward_to_go":
+                from .rtg import (
+                    event_rewards,
+                    future_returns,
+                    step_advantage,
+                    step_policy_loss,
+                )
+
+                events = event_rewards(
+                    times.repeat_interleave(k, 0),
+                    routes,
+                    (valid.sum(1) - 1).repeat_interleave(k),
+                    hover.repeat_interleave(k),
+                    endurance.repeat_interleave(k),
+                    config,
+                )
+                steps = routes.size(1)
+                advantage = step_advantage(
+                    future_returns(events)[:, :steps].reshape(len(batch), k, steps)
+                )
+                policy = step_policy_loss(
+                    advantage,
+                    details["step_log_probs"].reshape(len(batch), k, steps),
+                    details["step_mask"].reshape(len(batch), k, steps),
+                )
+                loss = policy
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             gradient = torch.nn.utils.clip_grad_norm_(
@@ -263,6 +294,20 @@ def _run_arm(
                     "Nonfinite fine-tuning loss/gradient; latest was not replaced."
                 )
             optimizer.step()
+            if greedy_only:
+                step_mask = details["step_mask"].reshape(len(batch), k, -1)
+                step_values = (
+                    advantage
+                    if arm == "reward_to_go"
+                    else advantage[:, :, None].expand_as(step_mask)
+                )[step_mask]
+                advantage_std = (
+                    step_values.std(unbiased=False).item()
+                    if step_values.numel()
+                    else 0.0
+                )
+            else:
+                advantage_std = advantage.std(unbiased=False).item()
             orders = routes.detach().cpu().reshape(len(batch), k, -1).tolist()
             diversity = np.mean(
                 [len({tuple(order) for order in graph}) / k for graph in orders]
@@ -274,7 +319,7 @@ def _run_arm(
                     policy.item(),
                     bonus.item(),
                     details["entropy"].mean().item(),
-                    advantage.std(unbiased=False).item(),
+                    advantage_std,
                     gradient.item(),
                     float(gradient.item() > config.gradient_clip_norm),
                     float(diversity),
@@ -311,13 +356,18 @@ def _run_arm(
             "entropy_coefficient": beta,
             "learning_rate": lr,
             "validation": report,
-            "best_sampling_epoch": best_models["sampling"]["epoch"],
+            "best_sampling_epoch": best_models.get("sampling", best_models["greedy"])[
+                "epoch"
+            ],
+            "training_branch": arm,
             "best_greedy_epoch": best_models["greedy"]["epoch"],
             "epoch_seconds": time.perf_counter() - started,
             "sampled_route_count": sampled,
             "training_instance_count": len(instances),
             "pool_version": pool.version if pool else 0,
         }
+        if greedy_only:
+            metrics["step_advantage_std"] = metrics["advantage_std"]
         history.append(metrics)
         scheduler.step()
         state.update(
@@ -340,10 +390,14 @@ def _run_arm(
         print(
             f"{arm} Epoch {epoch + 1:03d}/{config.epochs} | beta={beta:.6f} | "
             f"reward={metrics['mean_train_reward']:.4f} | feasible={report['feasible_rate']:.1%} | "
-            f"val best={report['mean_normalized_flight_cost']:.6f} | "
+            f"{'val greedy' if greedy_only else 'val best'}={report['mean_normalized_flight_cost']:.6f} | "
             f"greedy={report['greedy']['mean_normalized_flight_cost']:.6f} | "
-            f"best sampling/greedy epochs={metrics['best_sampling_epoch']}/{metrics['best_greedy_epoch']} | "
-            f"{metrics['epoch_seconds']:.1f}s",
+            + (
+                f"best greedy epoch={metrics['best_greedy_epoch']} | "
+                if greedy_only
+                else f"best sampling/greedy epochs={metrics['best_sampling_epoch']}/{metrics['best_greedy_epoch']} | "
+            )
+            + f"{metrics['epoch_seconds']:.1f}s",
             flush=True,
         )
     # Repair reports even if the process stopped after the final latest.pt write.
@@ -356,14 +410,18 @@ def _run_arm(
             output / "epoch0.pt", map_location="cpu", weights_only=False
         )["validation_metrics"],
         "sampling": {
-            "epoch": best_models["sampling"]["epoch"],
-            "validation": best_models["sampling"]["validation"],
+            "epoch": best_models.get("sampling", best_models["greedy"])["epoch"],
+            "validation": best_models.get("sampling", best_models["greedy"])[
+                "validation"
+            ],
         },
         "greedy": {
             "epoch": best_models["greedy"]["epoch"],
             "validation": best_models["greedy"]["validation"],
         },
     }
+    if greedy_only:
+        summary.pop("sampling")
     write_json(output / "summary.json", summary)
     return summary
 
@@ -380,12 +438,15 @@ def run_comparison(
     entropy_end: float = 0.0,
     resume: bool = False,
     references: dict | None = None,
+    greedy_only: bool = False,
 ) -> dict:
     """Same weights/data/seeds, fresh optimizer; old checkpoint participates in selection."""
     if not instances or not validation:
         raise ValueError(
             "Fine-tuning requires nonempty training and validation splits."
         )
+    if greedy_only:
+        entropy_start = entropy_end = 0.0
     entropy_coefficient(0, entropy_start, entropy_end, config.lr_schedule_epochs)
     if output.resolve() in checkpoint.resolve().parents:
         raise ValueError("Fine-tuning output must not contain the source checkpoint.")
@@ -411,6 +472,10 @@ def run_comparison(
         "lr_min",
         "lr_schedule_epochs",
     }
+    if greedy_only:
+        mutable.update({"decode_strategy", "decode_samples"})
+        if config.decode_strategy != "greedy" or config.decode_samples != 1:
+            raise ValueError("Greedy RTG comparison requires single greedy validation.")
     for key, value in asdict(config).items():
         if key not in mutable and parent["training_config"].get(key) != value:
             raise ValueError(f"Fine-tuning changed protected setting: {key}.")
@@ -429,6 +494,10 @@ def run_comparison(
             json.dumps(references, sort_keys=True).encode()
         ).hexdigest(),
     }
+    if greedy_only:
+        identity["experiment_type"] = "greedy_rtg_compare"
+    arms = ("trajectory", "reward_to_go") if greedy_only else ("control", "entropy")
+    kinds = ("greedy",) if greedy_only else ("sampling", "greedy")
     manifest = output / "experiment.json"
     if manifest.exists():
         if not resume or json.loads(manifest.read_text(encoding="utf-8")) != identity:
@@ -438,7 +507,7 @@ def run_comparison(
     else:
         if resume or any(
             (output / name).exists()
-            for name in ("control", "entropy", "comparison.json", "selected.pt")
+            for name in (*arms, "comparison.json", "selected.pt")
         ):
             raise ValueError(
                 "Missing experiment identity or orphan output; use a fresh output."
@@ -457,8 +526,12 @@ def run_comparison(
         write_json(manifest, identity)
     results = {}
     for arm, start, end in (
-        ("control", 0.0, 0.0),
-        ("entropy", entropy_start, entropy_end),
+        (arms[0], 0.0, 0.0),
+        (
+            arms[1],
+            0.0 if greedy_only else entropy_start,
+            0.0 if greedy_only else entropy_end,
+        ),
     ):
         results[arm] = _run_arm(
             parent,
@@ -473,30 +546,31 @@ def run_comparison(
             end,
             resume,
             references,
+            greedy_only,
         )
-    if results["control"]["baseline"] != results["entropy"]["baseline"]:
+    if results[arms[0]]["baseline"] != results[arms[1]]["baseline"]:
         raise ValueError("Paired arms have different baseline validation metrics.")
-    baseline = results["control"]["baseline"]
+    baseline = results[arms[0]]["baseline"]
     report = {
         "baseline": baseline,
         "arms": results,
         "identity": identity,
         "test_selection_note": "Validation-only selection. Test/87 is not loaded.",
     }
-    for kind in ("sampling", "greedy"):
+    for kind in kinds:
         selected, best = "baseline", _score(baseline, kind)
-        for arm in ("control", "entropy"):
+        for arm in arms:
             candidate = _score(results[arm][kind]["validation"], kind)
             if validation_is_better(candidate, best):
                 selected, best = arm, candidate
         path = output / (
-            "control/epoch0.pt"
+            f"{arms[0]}/epoch0.pt"
             if selected == "baseline"
             else f"{selected}/best_{kind}.pt"
         )
         payload = torch.load(path, map_location="cpu", weights_only=False)
         _save_checkpoint(payload, output / f"selected_{kind}.pt")
-        if kind == "sampling":
+        if kind == "sampling" or greedy_only:
             _save_checkpoint(payload, output / "selected.pt")
         report[f"selected_{kind}"] = selected
         print(
@@ -511,16 +585,22 @@ def run_comparison(
         "|模型|解码|最佳轮次|可行率|归一化飞行时间|有效区域加权gap|有效/总区域|",
         "|---|---|---:|---:|---:|---:|---:|",
     ]
-    for arm in ("baseline", "control", "entropy"):
-        for kind in ("sampling", "greedy"):
+    if greedy_only:
+        lines[2] = (
+            "|模型|解码|最佳轮次|可行率|飞行时间合计/s|归一化飞行时间|有效区域加权gap|有效/总区域|"
+        )
+        lines[3] = "|---|---|---:|---:|---:|---:|---:|---:|"
+    for arm in ("baseline", *arms):
+        for kind in kinds:
             v = baseline if arm == "baseline" else results[arm][kind]["validation"]
             score = _score(v, kind)
             epoch = 0 if arm == "baseline" else results[arm][kind]["epoch"]
             gap = score.get("weighted_optimality_gap")
             gap_text = "N/A" if gap is None else f"{gap:.4%}"
             count = int(score.get("optimality_gap_count", 0))
+            total_column = f"{v['total_flight_seconds']:.6f}|" if greedy_only else ""
             lines.append(
-                f"|{arm}|{kind}|{epoch}|{score['feasible_rate']:.2%}|{score['mean_normalized_flight_cost']:.8f}|{gap_text}|{count}/{len(validation)}|"
+                f"|{arm}|{kind}|{epoch}|{score['feasible_rate']:.2%}|{total_column}{score['mean_normalized_flight_cost']:.8f}|{gap_text}|{count}/{len(validation)}|"
             )
     lines.extend(
         [
@@ -617,6 +697,17 @@ def comparison_from_cli(
         if getattr(args, key) is not None
     }
     config = replace(config, **overrides)
+    greedy_only = args.mode == "greedy_rtg_compare"
+    if greedy_only:
+        config = replace(
+            config,
+            decode_strategy="greedy",
+            decode_samples=1,
+            batch_size=args.batch_size if args.batch_size is not None else 64,
+            batches_per_epoch=(
+                args.batches_per_epoch if args.batches_per_epoch is not None else 100
+            ),
+        )
 
     def make_pool() -> TrainingPool:
         return TrainingPool(
@@ -646,6 +737,7 @@ def comparison_from_cli(
         entropy_end=args.entropy_end,
         resume=args.resume,
         references=references,
+        greedy_only=greedy_only,
     )
     print(f"Validation-selected model: {args.output / 'selected.pt'}", flush=True)
     return 0

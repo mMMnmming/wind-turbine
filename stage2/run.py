@@ -285,7 +285,7 @@ def _run_search(
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description="Train or evaluate the wind-aware pointer network.")
-    parser.add_argument("mode", choices=("prepare_data", "train", "resume", "search", "evaluate", "finetune_compare"))
+    parser.add_argument("mode", choices=("prepare_data", "train", "resume", "search", "evaluate", "finetune_compare", "greedy_rtg_compare"))
     parser.add_argument("--input", type=Path, help="Defaults to turbine102.tsv for training and turbine87.tsv for evaluation.")
     parser.add_argument("--stage1-config", type=Path, default=ROOT.parent / "stage1" / "config.json")
     parser.add_argument("--regions-json", type=Path, help="Existing Stage-1 region JSON, for evaluation.")
@@ -325,7 +325,7 @@ def main() -> int:
     args = parser.parse_args()
     args.input = _resolve_input_path(args.mode, args.input)
 
-    if args.mode == "finetune_compare":
+    if args.mode in ("finetune_compare", "greedy_rtg_compare"):
         from .finetune import comparison_from_cli
         return comparison_from_cli(args, parser)
     if args.resume:

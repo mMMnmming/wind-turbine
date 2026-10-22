@@ -86,7 +86,9 @@ class EdgeAttentionPolicy(nn.Module):
         steps = int(counts.max().item())
         if not steps:
             result = (torch.empty(batch, 0, dtype=torch.long, device=encoded.device), encoded.sum((1, 2)) * 0)
-            return (*result, {"entropy": result[1]}) if return_details else result
+            return (*result, {"entropy": result[1],
+                              "step_log_probs": encoded.sum((1, 2))[:, None].expand(-1, 0),
+                              "step_mask": torch.empty(batch, 0, dtype=torch.bool, device=encoded.device)}) if return_details else result
         visited = ~valid.clone()
         visited[:, 0] = True
         current = torch.zeros(batch, dtype=torch.long, device=encoded.device)
@@ -125,7 +127,9 @@ class EdgeAttentionPolicy(nn.Module):
             visited = visited.scatter(1, action[:, None], True)
             current = action
         result = (torch.stack(orders, 1), torch.stack(logps, 1).sum(1))
-        details = {"entropy": torch.stack(entropies, 1).sum(1) / counts.clamp_min(1)}
+        details = {"entropy": torch.stack(entropies, 1).sum(1) / counts.clamp_min(1),
+                   "step_log_probs": torch.stack(logps, 1),
+                   "step_mask": torch.arange(steps, device=encoded.device)[None] < counts[:, None]}
         return (*result, details) if return_details else result
 
     def forward(self, features: Tensor, decode_type: str = "sample", valid_node_mask: Tensor | None = None,
