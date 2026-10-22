@@ -11,10 +11,10 @@ import sys
 import threading
 import time
 
-from .candidate import CandidateProposal, validate_candidate_source
+from .candidate import CANDIDATE_BUILTINS, CandidateProposal, validate_candidate_source
 from .domain import DeploymentConfig, Turbine
 
-_WORKER = r"""import json,math,random,itertools,collections,typing,sys
+_WORKER = r"""import json,math,random,itertools,collections,typing,sys,builtins
 from types import SimpleNamespace,ModuleType
 data=json.load(sys.stdin)
 sys.path.insert(0,data['runtime'])
@@ -27,7 +27,7 @@ tools=CandidateTools([Turbine(**t) for t in data['turbines']],DeploymentConfig(*
 facade=ModuleType('candidate_tools')
 for name in PUBLIC_METHODS: setattr(facade,name,getattr(tools,name))
 facade.BudgetExceeded=BudgetExceeded
-allowed={"abs":abs,"all":all,"any":any,"bool":bool,"dict":dict,"enumerate":enumerate,"filter":filter,"float":float,"frozenset":frozenset,"int":int,"isinstance":isinstance,"len":len,"list":list,"map":map,"max":max,"min":min,"next":next,"range":range,"reversed":reversed,"round":round,"set":set,"sorted":sorted,"str":str,"sum":sum,"tuple":tuple,"zip":zip,"Exception":Exception,"ValueError":ValueError,"KeyError":KeyError,"RuntimeError":RuntimeError}
+allowed={name:getattr(builtins,name) for name in data['builtins'] if name not in ('getattr','hasattr')}
 mods={"math":math,"random":random,"itertools":itertools,"collections":collections,"typing":typing,"candidate_tools":facade}
 def safe_import(name,globals=None,locals=None,fromlist=(),level=0):
     if name not in mods or level: raise ImportError('module not allowed')
@@ -41,10 +41,29 @@ class TurbineInput(dict):
     def x_km(self): return self['x_km']
     @property
     def y_km(self): return self['y_km']
+C=SimpleNamespace(**data['config'])
+config_fields=frozenset(data['config'])
+turbine_fields=frozenset(('identifier','x_km','y_km'))
+missing=object()
+def public_getattr(obj,name,default=missing):
+    if not isinstance(name,str): raise TypeError('attribute name must be a string')
+    if name.startswith('_'): raise ValueError('private attribute reads are forbidden')
+    if obj is C: fields=config_fields
+    elif type(obj) is TurbineInput: fields=turbine_fields
+    else: raise ValueError('getattr/hasattr only support public input config or turbine fields')
+    if name in fields: return getattr(obj,name)
+    if default is not missing: return default
+    raise AttributeError('No public input field: '+name)
+def public_hasattr(obj,name):
+    try: public_getattr(obj,name)
+    except AttributeError: return False
+    return True
+allowed['getattr']=public_getattr
+allowed['hasattr']=public_hasattr
 termination='returned'
 try:
     exec(compile(data['source'],sys.argv[1],'exec'),scope,scope)
-    answer=scope['solve']([TurbineInput(t) for t in data['turbines']],SimpleNamespace(**data['config']),int(data['seed']))
+    answer=scope['solve']([TurbineInput(t) for t in data['turbines']],C,int(data['seed']))
 except BudgetExceeded as error:
     answer=tools.best()
     if answer is None: raise RuntimeError('Budget exhausted without explicitly remembered feasible deployment') from error
@@ -118,6 +137,7 @@ def run_candidate(
         ],
         "config": {n: getattr(config, n) for n in config.__dataclass_fields__},
         "seed": seed,
+        "builtins": sorted(CANDIDATE_BUILTINS),
         "source": source,
         "runtime": str(_runtime(source_path)),
         "limits": effective_limits,

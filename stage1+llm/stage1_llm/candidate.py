@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import ast
+import symtable
 from dataclasses import dataclass
 
 
@@ -29,6 +30,47 @@ _ALLOWED_IMPORTS = {
     "typing",
     "candidate_tools",
 }
+
+# One contract shared by source validation and the isolated worker. Reflective
+# reads are wrappers, never the unrestricted builtins with the same names.
+CANDIDATE_BUILTINS = frozenset(
+    {
+        "abs",
+        "all",
+        "any",
+        "bool",
+        "dict",
+        "enumerate",
+        "filter",
+        "float",
+        "frozenset",
+        "int",
+        "isinstance",
+        "len",
+        "list",
+        "map",
+        "max",
+        "min",
+        "next",
+        "range",
+        "reversed",
+        "round",
+        "set",
+        "sorted",
+        "str",
+        "sum",
+        "tuple",
+        "zip",
+        "Exception",
+        "ValueError",
+        "KeyError",
+        "RuntimeError",
+        "TypeError",
+        "AttributeError",
+        "getattr",
+        "hasattr",
+    }
+)
 
 
 def validate_candidate_source(source: str) -> None:
@@ -75,6 +117,12 @@ def validate_candidate_source(source: str) -> None:
             )
             if any(name not in _ALLOWED_IMPORTS for name in names):
                 raise ValueError("Candidate imports a module outside the allowlist.")
+            if isinstance(node, ast.ImportFrom) and any(
+                item.name == "*" for item in node.names
+            ):
+                raise ValueError(
+                    "Wildcard imports are not supported; import explicit public names."
+                )
         if isinstance(node, ast.Name) and node.id.startswith("__"):
             raise ValueError("Dunder names are not allowed in candidate source.")
         if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
@@ -86,3 +134,40 @@ def validate_candidate_source(source: str) -> None:
             in {"eval", "exec", "compile", "open", "__import__", "input"}
         ):
             raise ValueError(f"Candidate uses forbidden builtin: {node.func.id}.")
+    # Python's scope analysis distinguishes globals from parameters, closures,
+    # comprehensions, aliases and local imports. This does not prove all runtime
+    # paths valid (e.g. conditional local initialization still needs preflight).
+    try:
+        root = symtable.symtable(source, "<candidate>", "exec")
+    except SyntaxError as error:
+        raise ValueError(f"Candidate has invalid Python scope: {error}") from error
+    tables = [root]
+    for table in tables:
+        tables.extend(table.get_children())
+    defined = {
+        symbol.get_name()
+        for symbol in root.get_symbols()
+        if symbol.is_assigned() or symbol.is_imported() or symbol.is_namespace()
+    }
+    defined.update(
+        symbol.get_name()
+        for table in tables
+        for symbol in table.get_symbols()
+        if symbol.is_global() and (symbol.is_assigned() or symbol.is_imported())
+    )
+    available = defined | CANDIDATE_BUILTINS | {"math", "random"}
+    unknown = sorted(
+        {
+            symbol.get_name()
+            for table in tables
+            for symbol in table.get_symbols()
+            if symbol.is_referenced()
+            and symbol.is_global()
+            and symbol.get_name() not in available
+        }
+    )
+    if unknown:
+        raise ValueError(
+            f"Names not available in candidate runtime: {', '.join(unknown)}. "
+            "Use the documented builtins or define/import the helper explicitly."
+        )

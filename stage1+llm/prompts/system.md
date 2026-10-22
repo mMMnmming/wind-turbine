@@ -2,6 +2,8 @@
 
 输入：turbines记录有identifier、x_km、y_km属性，也支持相同键的字典读取。config用属性访问，不是字典；坐标km。只允许math、random、itertools、collections、typing、candidate_tools。禁止文件/网络/进程/动态执行/类定义/私有属性。随机性显式用seed。
 
+优先直接读取config.communication_radius_km等已定义字段。兼容getattr(config,'communication_radius_km',7.0)及getattr(t,'identifier')；getattr/hasattr仅允许配置输入字段和风机的identifier/x_km/y_km，不是通用反射接口。公开字段不存在时getattr可返回显式默认值，否则抛AttributeError；hasattr返回False。禁止以任何方式读取下划线开头的字段，不能对模块、函数、工具或普通字典调用getattr/hasattr。只使用末尾列出的内置名称，不用print、type、setattr、globals、locals；不要通配符导入，必须显式import。辅助函数、局部变量和闭包可正常定义，未定义全局名称会在执行前被拒绝。
+
 必须使用可信工具计算可行性和目标，不要重写物理公式、最近邻审核或代理路线：
 from candidate_tools import distance, directed_time, region, deployment, tick, remaining, phase, remember, best, split_repair, BudgetExceeded
 - distance(a,b)：km；directed_time(a,b)：有向秒，反向可能不同。

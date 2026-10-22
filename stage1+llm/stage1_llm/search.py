@@ -12,7 +12,7 @@ import random
 import time
 
 from .artifacts import RunArtifacts, run_path, safe_child, redact_secrets
-from .candidate import validate_candidate_source
+from .candidate import CANDIDATE_BUILTINS, validate_candidate_source
 from .client import DeepSeekClient, DeepSeekSettings
 from .data import fingerprint, prepare_data, turbines_from_record
 from .domain import Turbine, result_as_dict, effective_service_radius_km
@@ -869,6 +869,11 @@ class SearchController:
     ) -> Path:
         self.bundle = prepare_data(self.settings)
         system = (PROMPTS / "system.md").read_text(encoding="utf-8")
+        system += (
+            "\n执行器支持的内置名称仅为："
+            + ", ".join(sorted(CANDIDATE_BUILTINS))
+            + "。不要调用未列出的内置函数。\n"
+        )
         self.identity = self._identity(self.bundle, system)
         if not resume and run_id and run_path(self.outputs, run_id).exists():
             raise FileExistsError(

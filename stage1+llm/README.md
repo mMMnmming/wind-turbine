@@ -42,6 +42,8 @@ python -u "stage1+llm/run.py" prepare-data --search-config "stage1+llm/config/se
 
 候选仍定义 `solve(turbines, config, seed)` 并返回nest_ids、assignments。LLM决定部署策略；不再重复实现物理公式。受控导入：
 
+执行器兼容 `getattr(config, 'communication_radius_km', 7.0)`，但getattr/hasattr仅能读取配置及风机记录的公开输入字段，不能读取私有字段或反射模块/函数/工具。优先直接使用config属性；未知公开字段可以使用getattr默认值。内置名称清单从执行器同一契约自动附加到LLM提示词；不支持的内置名称或未定义全局名称在执行前明确报错（不保证发现全部运行时错误）。禁止通配符导入，改用显式导入。此次兼容修复改变了实现/提示词指纹，必须新建run ID，不要恢复修复前的实验。
+
 ```python
 from candidate_tools import region, deployment, split_repair, remember, best, tick, remaining, phase
 ```
