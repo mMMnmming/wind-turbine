@@ -131,11 +131,11 @@ class CandidateContractTests(unittest.TestCase):
             first = controller(settings, root, [SOLO])
             calls = []
 
-            def interrupt(path, points, *args):
+            def interrupt(path, points, *args, **kwargs):
                 calls.append(len(points))
                 if len(calls) == 2:
                     raise KeyboardInterrupt
-                return run_candidate(path, points, *args)
+                return run_candidate(path, points, *args, **kwargs)
 
             with contextlib.redirect_stdout(io.StringIO()), patch(
                 "stage1_llm.search.run_candidate", side_effect=interrupt

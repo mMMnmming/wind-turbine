@@ -56,8 +56,7 @@ class TrustedToolTests(unittest.TestCase):
         self.assertFalse(row["feasible"])
         self.assertGreater(row["diagnostics"][0]["excess"], 0)
         self.assertFalse(tools.region("a", ["b"])["feasible"])
-        with self.assertRaises(ValueError):
-            tools.region("a", ["a", "missing"])
+        self.assertFalse(tools.region("a", ["a", "missing"])["feasible"])
 
     def test_budget_and_explicit_best(self):
         from stage1_llm.candidate_tools import BudgetExceeded

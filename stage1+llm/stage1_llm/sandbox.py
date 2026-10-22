@@ -14,19 +14,49 @@ import time
 from .candidate import CANDIDATE_BUILTINS, CandidateProposal, validate_candidate_source
 from .domain import DeploymentConfig, Turbine
 
-_WORKER = r"""import json,math,random,itertools,collections,typing,sys,builtins
+
+class CandidateExecutionError(RuntimeError):
+    """Execution failure with structured diagnostics retained across processes."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: str = "tool_contract_error",
+        telemetry: dict | None = None,
+    ):
+        super().__init__(message)
+        self.status = status
+        self.telemetry = telemetry or {}
+
+
+_WORKER = r"""import json,math,random,itertools,collections,typing,sys,builtins,inspect
 from types import SimpleNamespace,ModuleType
 data=json.load(sys.stdin)
 sys.path.insert(0,data['runtime'])
 from stage1_llm.candidate_tools import CandidateTools,BudgetExceeded,PUBLIC_METHODS
+import stage1_llm.candidate_tools as tool_runtime
 from stage1_llm.domain import DeploymentConfig,Turbine
 def progress(row):
     sys.stderr.write('STAGE1_TOOLS '+json.dumps(row,allow_nan=False)+'\n');sys.stderr.flush()
+contract_version=getattr(tool_runtime,'TOOLS_VERSION',1)
+extra={'candidate_filename':sys.argv[1]} if contract_version>=2 else {}
 tools=CandidateTools([Turbine(**t) for t in data['turbines']],DeploymentConfig(**data['config']),
-                     observer=progress,**data['limits'])
+                     observer=progress,**data['limits'],**extra)
 facade=ModuleType('candidate_tools')
-for name in PUBLIC_METHODS: setattr(facade,name,getattr(tools,name))
+def bind_tool(name):
+    method=getattr(tools,name)
+    if contract_version<2: return method
+    signature=inspect.signature(method)
+    def invoke(*args,**kwargs):
+        try: signature.bind(*args,**kwargs)
+        except TypeError:
+            tools._error(name,'arguments',str(signature),kwargs,'invalid_arguments')
+        return method(*args,**kwargs)
+    return invoke
+for name in PUBLIC_METHODS: setattr(facade,name,bind_tool(name))
 facade.BudgetExceeded=BudgetExceeded
+if contract_version>=2: facade.ToolContractError=tool_runtime.ToolContractError
 allowed={name:getattr(builtins,name) for name in data['builtins'] if name not in ('getattr','hasattr')}
 mods={"math":math,"random":random,"itertools":itertools,"collections":collections,"typing":typing,"candidate_tools":facade}
 def safe_import(name,globals=None,locals=None,fromlist=(),level=0):
@@ -61,15 +91,32 @@ def public_hasattr(obj,name):
 allowed['getattr']=public_getattr
 allowed['hasattr']=public_hasattr
 termination='returned'
+failure=None
+answer=None
 try:
     exec(compile(data['source'],sys.argv[1],'exec'),scope,scope)
     answer=scope['solve']([TurbineInput(t) for t in data['turbines']],C,int(data['seed']))
 except BudgetExceeded as error:
-    answer=tools.best()
-    if answer is None: raise RuntimeError('Budget exhausted without explicitly remembered feasible deployment') from error
+    if not tools.stats().get('contract_error_count',0): answer=tools.best()
+    if answer is None: failure=RuntimeError('Budget exhausted without explicitly remembered feasible deployment')
     termination='budget_exhausted'
-if not isinstance(answer,dict) or set(answer)!={'nest_ids','assignments'}: raise ValueError('solve must return exactly nest_ids and assignments')
-json.dump({'proposal':answer,'telemetry':dict(tools.stats(),termination=termination)},sys.stdout,allow_nan=False)
+except Exception as error:
+    failure=error
+if failure is None:
+    if contract_version>=2:
+        try: tools._proposal_schema('solve',answer)
+        except tool_runtime.ToolContractError as error: failure=error
+    elif not isinstance(answer,dict) or set(answer)!={'nest_ids','assignments'}:
+        failure=ValueError('solve must return exactly nest_ids and assignments')
+telemetry=dict(tools.stats(),termination=termination)
+if telemetry.get('contract_error_count',0):
+    telemetry['termination']='tool_contract_error'
+    json.dump({'status':'tool_contract_error','proposal':None,'telemetry':telemetry,
+               'final_error_type':type(failure).__name__ if failure else None},sys.stdout,allow_nan=False)
+elif failure is not None:
+    raise failure
+else:
+    json.dump({'status':'returned','proposal':answer,'telemetry':telemetry},sys.stdout,allow_nan=False)
 """
 
 
@@ -145,6 +192,9 @@ def run_candidate(
     output: list[str] = []
     errors: list[str] = []
     events: queue.Queue[dict] = queue.Queue()
+    contract_events: list[dict] = []
+    contract_event_count = 0
+    timed_out = False
     started = time.perf_counter()
     proc = subprocess.Popen(
         [sys.executable, "-I", "-X", "utf8", "-c", _WORKER, str(source_path)],
@@ -168,6 +218,20 @@ def run_candidate(
             else:
                 sink.append(line)
 
+    def handle_event(row):
+        nonlocal contract_event_count
+        if row.get("kind") == "tool_contract_error":
+            contract_event_count += 1
+            if len(contract_events) < 5:
+                contract_events.append({k: v for k, v in row.items() if k != "kind"})
+            if telemetry is not None:
+                telemetry.update(
+                    contract_error_count=contract_event_count,
+                    contract_errors=list(contract_events),
+                )
+        if observer:
+            observer(row)
+
     threads = [
         threading.Thread(target=drain, args=(proc.stdout, output), daemon=True),
         threading.Thread(target=drain, args=(proc.stderr, errors, True), daemon=True),
@@ -180,8 +244,7 @@ def run_candidate(
         while True:
             while not events.empty():
                 row = events.get_nowait()
-                if observer:
-                    observer(row)
+                handle_event(row)
             remaining = timeout_seconds - (time.perf_counter() - started)
             if remaining <= 0:
                 if telemetry is not None:
@@ -189,7 +252,8 @@ def run_candidate(
                         termination="hard_timeout",
                         seconds=time.perf_counter() - started,
                     )
-                raise TimeoutError(f"Candidate exceeded {timeout_seconds}s time limit.")
+                timed_out = True
+                break
             try:
                 proc.wait(timeout=min(0.1, remaining))
                 break
@@ -206,9 +270,37 @@ def run_candidate(
                 pipe.close()
         while not events.empty():
             row = events.get_nowait()
-            if observer:
-                observer(row)
+            handle_event(row)
+    if timed_out:
+        if contract_events:
+            details = dict(
+                telemetry or {},
+                contract_errors=contract_events,
+                contract_error_count=contract_event_count,
+                contract_error_count_is_lower_bound=True,
+                termination="hard_timeout",
+                final_error_type="TimeoutError",
+            )
+            if telemetry is not None:
+                telemetry.update(details)
+            raise CandidateExecutionError(
+                contract_events[0]["message"], telemetry=details
+            )
+        raise TimeoutError(f"Candidate exceeded {timeout_seconds}s time limit.")
     if proc.returncode:
+        if contract_events:
+            details = dict(
+                telemetry or {},
+                contract_errors=contract_events,
+                contract_error_count=contract_event_count,
+                contract_error_count_is_lower_bound=True,
+                termination="tool_contract_error",
+            )
+            if telemetry is not None:
+                telemetry.update(details)
+            raise CandidateExecutionError(
+                contract_events[0]["message"], telemetry=details
+            )
         raise RuntimeError(
             ("".join(errors) or f"candidate exited {proc.returncode}")[-3000:]
         )
@@ -217,15 +309,31 @@ def run_candidate(
         result = envelope["proposal"]
     except (json.JSONDecodeError, KeyError, TypeError) as error:
         raise ValueError("Candidate returned invalid JSON.") from error
-    if not isinstance(result.get("nest_ids"), list) or not isinstance(
-        result.get("assignments"), dict
+    details = envelope.get("telemetry", {})
+    if envelope.get("final_error_type"):
+        details["final_error_type"] = envelope["final_error_type"]
+    if telemetry is not None:
+        telemetry.update(details)
+    if envelope.get("status") == "tool_contract_error":
+        raise CandidateExecutionError(
+            details["contract_errors"][0]["message"], telemetry=details
+        )
+    if (
+        not isinstance(result, dict)
+        or not isinstance(result.get("nest_ids"), list)
+        or not isinstance(result.get("assignments"), dict)
     ):
         raise ValueError(
             "Candidate output must contain list nest_ids and mapping assignments."
         )
-    if telemetry is not None:
-        telemetry.update(envelope["telemetry"])
+    if any(not isinstance(n, str) for n in result["nest_ids"]) or any(
+        not isinstance(k, str) or not isinstance(v, str)
+        for k, v in result["assignments"].items()
+    ):
+        raise ValueError(
+            "Candidate IDs must be strings; automatic str() coercion is forbidden."
+        )
     return CandidateProposal(
-        [str(x) for x in result["nest_ids"]],
-        {str(k): str(v) for k, v in result["assignments"].items()},
+        list(result["nest_ids"]),
+        dict(result["assignments"]),
     )

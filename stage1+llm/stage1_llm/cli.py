@@ -238,7 +238,8 @@ def main(argv: list[str] | None = None) -> int:
                         telemetry=telemetry,
                         observer=lambda progress: artifacts.log(
                             f"Candidate-reported progress={progress}",
-                            event="algorithm_progress",
+                            event=progress.get("kind", "algorithm_progress"),
+                            details=progress,
                         ),
                     )
             except Exception as error:
@@ -246,7 +247,7 @@ def main(argv: list[str] | None = None) -> int:
                     "evaluation.json",
                     {
                         "feasible": False,
-                        "status": "algorithm_error",
+                        "status": getattr(error, "status", "algorithm_error"),
                         "error": f"{type(error).__name__}: {error}",
                         "algorithm_seconds": time.perf_counter() - start,
                         "telemetry": telemetry,

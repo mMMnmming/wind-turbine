@@ -13,13 +13,14 @@ import time
 
 from .artifacts import RunArtifacts, run_path, safe_child, redact_secrets
 from .candidate import CANDIDATE_BUILTINS, validate_candidate_source
+from .candidate_tools import TOOLS_VERSION
 from .client import DeepSeekClient, DeepSeekSettings
 from .data import fingerprint, prepare_data, turbines_from_record
 from .domain import Turbine, result_as_dict, effective_service_radius_km
 from .evaluator import evaluate_proposal
 from .exports import write_front
 from .reward import OBJECTIVE_VERSION, pareto_front, parent_pool, search_reward
-from .sandbox import run_candidate
+from .sandbox import CandidateExecutionError, run_candidate
 from .selection import DiscountedUCB, SlidingWindowUCB
 from .settings import SearchSettings
 
@@ -98,6 +99,7 @@ class SearchController:
         return _jsonable(
             {
                 "search_version": SEARCH_VERSION,
+                "tool_contract_version": TOOLS_VERSION,
                 "settings": config,
                 "data_fingerprint": bundle["fingerprint"],
                 "objective_version": OBJECTIVE_VERSION,
@@ -113,6 +115,7 @@ class SearchController:
             "search_state.json",
             {
                 "search_version": SEARCH_VERSION,
+                "tool_contract_version": TOOLS_VERSION,
                 "identity": self.identity,
                 "evaluation_budget": self.settings.evaluation_budget,
                 "archive": self.archive,
@@ -394,6 +397,26 @@ class SearchController:
             for r in self.history[-3:]
         ]
         feedback["work_limits"] = self._limits()
+        if parent and parent["evaluation"].get("status") == "tool_contract_error":
+            unique: list[dict] = []
+            for error in parent["evaluation"].get("contract_errors", []):
+                diagnostic_key = (
+                    error.get("tool"),
+                    error.get("code"),
+                    error.get("field"),
+                )
+                if diagnostic_key not in [
+                    (d.get("tool"), d.get("code"), d.get("field")) for d in unique
+                ]:
+                    unique.append(error)
+            feedback["parent_diagnostic"]["contract_errors"] = unique[:3]
+            # The structured journal already contains concise messages. Do not
+            # repeat it in diagnostics, violations and a full traceback.
+            feedback["parent_diagnostic"].pop("diagnostics", None)
+            feedback["parent_diagnostic"].pop("violations", None)
+            feedback["tool_contract_example"] = (
+                'proposal=make_proposal(assignments); checked=deployment(proposal,proxy=True); checked["feasible"]; checked["objectives"]; remaining()["seconds"]; remember(proposal); return proposal'
+            )
         text = json.dumps(
             feedback, ensure_ascii=False, separators=(",", ":"), default=str
         )
@@ -420,6 +443,11 @@ class SearchController:
         row["evaluation_phase"] = "constraint_preflight"
         done = row.setdefault("constraint_checks", [])
         if any(not d["feasible"] for d in done):
+            failed = next(d for d in done if not d["feasible"])
+            if failed.get("telemetry", {}).get("contract_error_count"):
+                raise CandidateExecutionError(
+                    failed["error"], telemetry=failed["telemetry"]
+                )
             raise ValueError("Saved constraint preflight failed.")
         radius = effective_service_radius_km(self.settings.deployment)
         cases = [
@@ -447,25 +475,56 @@ class SearchController:
                 event="constraint_preflight_start",
             )
             started = time.perf_counter()
-            with artifacts.heartbeat(
-                f"{row['candidate_id']} constraint preflight={name}",
-                self.settings.heartbeat_seconds,
-            ):
-                proposal = run_candidate(
-                    source_path,
-                    points,
-                    self.settings.deployment,
-                    self.settings.seed,
-                    min(10, self.settings.candidate_timeout_seconds),
-                    limits=self._limits(),
+            telemetry: dict = {}
+            try:
+                with artifacts.heartbeat(
+                    f"{row['candidate_id']} constraint preflight={name}",
+                    self.settings.heartbeat_seconds,
+                ):
+                    proposal = run_candidate(
+                        source_path,
+                        points,
+                        self.settings.deployment,
+                        self.settings.seed,
+                        min(10, self.settings.candidate_timeout_seconds),
+                        limits=self._limits(),
+                        telemetry=telemetry,
+                        observer=lambda event: self._tool_event(
+                            artifacts, row, name, event
+                        ),
+                    )
+                    checked = evaluate_proposal(
+                        points, self.settings.deployment, proposal
+                    )
+            except Exception as error:
+                done.append(
+                    {
+                        "name": name,
+                        "feasible": False,
+                        "seconds": time.perf_counter() - started,
+                        "telemetry": telemetry,
+                        "error": str(error),
+                        "diagnostics": telemetry.get("contract_errors", []),
+                    }
                 )
-                checked = evaluate_proposal(points, self.settings.deployment, proposal)
+                self._persist(artifacts)
+                raise
+            except KeyboardInterrupt:
+                row.setdefault("interrupted_checks", []).append(
+                    {
+                        "name": name,
+                        "seconds": time.perf_counter() - started,
+                        "telemetry": telemetry,
+                    }
+                )
+                raise
             check = {
                 "name": name,
                 "feasible": checked.feasible,
                 "violations": list(checked.violations),
                 "diagnostics": list(checked.diagnostics),
                 "seconds": time.perf_counter() - started,
+                "telemetry": telemetry,
             }
             done.append(check)
             self._persist(artifacts)
@@ -496,6 +555,10 @@ class SearchController:
         if check["status"] == "passed":
             return
         if check["status"] == "failed":
+            if check.get("telemetry", {}).get("contract_error_count"):
+                raise CandidateExecutionError(
+                    check["error"], telemetry=check["telemetry"]
+                )
             raise RuntimeError(check["error"])
         cases = (
             ("single", [(0.0, 0.0)]),
@@ -512,6 +575,7 @@ class SearchController:
                 event="preflight_start",
             )
             start = time.perf_counter()
+            telemetry: dict = {}
             try:
                 with artifacts.heartbeat(
                     f"{row['candidate_id']} preflight={name}",
@@ -523,6 +587,10 @@ class SearchController:
                         self.settings.deployment,
                         self.settings.seed,
                         timeout,
+                        telemetry=telemetry,
+                        observer=lambda event: self._tool_event(
+                            artifacts, row, name, event
+                        ),
                     )
             except Exception as error:
                 elapsed = time.perf_counter() - start
@@ -530,6 +598,7 @@ class SearchController:
                     status="failed",
                     failed_case=name,
                     error=f"{type(error).__name__}: {error}",
+                    telemetry=telemetry,
                 )
                 check["seconds"] += elapsed
                 self._persist(artifacts)
@@ -538,9 +607,23 @@ class SearchController:
                     event="preflight_end",
                 )
                 raise
+            except KeyboardInterrupt:
+                row.setdefault("interrupted_checks", []).append(
+                    {
+                        "name": name,
+                        "seconds": time.perf_counter() - start,
+                        "telemetry": telemetry,
+                    }
+                )
+                raise
             elapsed = time.perf_counter() - start
             check["cases"].append(
-                {"name": name, "nodes": len(points), "seconds": elapsed}
+                {
+                    "name": name,
+                    "nodes": len(points),
+                    "seconds": elapsed,
+                    "telemetry": telemetry,
+                }
             )
             check["seconds"] += elapsed
             self._persist(artifacts)
@@ -552,7 +635,26 @@ class SearchController:
         check["status"] = "passed"
         self._persist(artifacts)
 
+    def _tool_event(self, artifacts, row, instance, event):
+        kind = event.get("kind", "algorithm_progress")
+        artifacts.log(
+            f"{row['candidate_id']} instance={instance} {kind}: {event}",
+            event=kind,
+            details=event,
+        )
+
     def _evaluate(self, artifacts: RunArtifacts, row: dict) -> dict:
+        # A checkpoint must not erase observed contract failures just because
+        # the supervisor was interrupted before the round was finalized.
+        for attempt in row.get("failed_attempts", []) + row.get(
+            "interrupted_checks", []
+        ):
+            prior_telemetry = attempt.get("telemetry", {})
+            if prior_telemetry.get("contract_error_count"):
+                raise CandidateExecutionError(
+                    prior_telemetry["contract_errors"][0]["message"],
+                    telemetry=prior_telemetry,
+                )
         row["evaluation_phase"] = "source_validation"
         source_path = safe_child(artifacts.root, row["source_path"])
         source = source_path.read_text(encoding="utf-8")
@@ -584,7 +686,7 @@ class SearchController:
                 event="dataset_start",
             )
             start = time.perf_counter()
-            telemetry = {}
+            telemetry: dict = {}
             try:
                 with artifacts.heartbeat(
                     f"{row['candidate_id']} dataset={record['name']} running",
@@ -598,10 +700,8 @@ class SearchController:
                         self.settings.candidate_timeout_seconds,
                         limits=self._limits(),
                         telemetry=telemetry,
-                        observer=lambda progress: artifacts.log(
-                            f"{row['candidate_id']} dataset={record['name']} candidate-reported progress={progress}",
-                            event="algorithm_progress",
-                            progress=progress,
+                        observer=lambda progress: self._tool_event(
+                            artifacts, row, record["name"], progress
                         ),
                     )
             except (Exception, KeyboardInterrupt):
@@ -840,6 +940,10 @@ class SearchController:
                     "algorithm_seconds",
                     "evaluation_seconds",
                     "preflight_seconds",
+                    "constraint_preflight_seconds",
+                    "interrupted_check_seconds",
+                    "status",
+                    "tool_contract_error_count",
                 ]
             )
             for row in self.history:
@@ -861,6 +965,10 @@ class SearchController:
                         ),
                         sum(d["evaluation_seconds"] for d in data),
                         row.get("preflight", {}).get("seconds", 0.0),
+                        sum(c["seconds"] for c in row.get("constraint_checks", [])),
+                        sum(c["seconds"] for c in row.get("interrupted_checks", [])),
+                        row["evaluation"]["status"],
+                        row["evaluation"].get("contract_error_count", 0),
                     ]
                 )
 
@@ -1018,7 +1126,11 @@ class SearchController:
                     evaluation = self._evaluate(artifacts, row)
                 except Exception as error:
                     evaluation = {
-                        "status": "candidate_error",
+                        "status": (
+                            error.status
+                            if isinstance(error, CandidateExecutionError)
+                            else "candidate_error"
+                        ),
                         "feasible": False,
                         "datasets": row.get("completed_datasets", []),
                         "violations": [f"{type(error).__name__}: {error}"],
@@ -1030,10 +1142,19 @@ class SearchController:
                             for d in c["diagnostics"]
                         ],
                     }
+                    if isinstance(error, CandidateExecutionError):
+                        evaluation.update(
+                            telemetry=error.telemetry,
+                            contract_errors=error.telemetry.get("contract_errors", []),
+                            contract_error_count=error.telemetry.get(
+                                "contract_error_count", 0
+                            ),
+                        )
+                        evaluation["diagnostics"] = evaluation["contract_errors"]
                     artifacts.log(
                         f"{row['candidate_id']} phase={evaluation['failure_stage']} "
                         f"dataset={evaluation['failed_dataset']} candidate error: {error}",
-                        event="candidate_error",
+                        event=evaluation["status"],
                     )
                 self._finish(artifacts, row, evaluation)
         except (KeyboardInterrupt, MemoryError, OSError):
@@ -1054,6 +1175,7 @@ class SearchController:
             "summary.json",
             {
                 "status": status,
+                "tool_contract_version": TOOLS_VERSION,
                 "stop_reason": reason,
                 "evaluated_rounds": len(self.history),
                 "pareto_candidates": [r["candidate_id"] for r in self.archive],

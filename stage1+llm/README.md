@@ -48,7 +48,7 @@ python -u "stage1+llm/run.py" prepare-data --search-config "stage1+llm/config/se
 from candidate_tools import region, deployment, split_repair, remember, best, tick, remaining, phase
 ```
 
-- `region(nest_id,members,proxy=False)`：审核含机巢的完整成员集合，返回可行性、数值违规和安全余量。
+- `region(nest_id,members,proxy=False)`：审核含机巢的完整成员集合，返回可行性、数值违规和安全余量。粗筛须显式传False，实际默认proxy=True，不改变旧工具语义。
 - `region(...,proxy=True)`：额外计算统一代理路线及航时。
 - `deployment(proposal,proxy=True)`：完整审核，返回三个objectives；proxy=False时不生成目标。
 - `distance(a,b)`、`directed_time(a,b)`：km和有向秒。
@@ -129,3 +129,46 @@ python -u "stage1+llm/outputs/search-v4/selected/C0008/run_selected.py" --input 
 独立入口在导入快照代码前验证哈希，默认沿用保存的种子/预算，输出JSON；完整绘图和regions导出请使用evaluate。
 
 分区改变后必须重新计算对应分支定界参考，不能沿用旧四区域最优值。当前验证是软件流程验收，不承诺LLM部署质量、泛化能力或优于论文；最终效果须在公平实验中验证。
+
+## 8. 工具契约 v2：此次真实失败的修复
+
+此次只加固接口与诊断，不改变物理约束、三目标、UCB选择或Stage2。区分三类数据：
+
+| 数据 | 形式 | 使用方式 |
+|---|---|---|
+| 归属映射 | `{"a":"a","b":"a"}` | `split_repair(assignments)`、`make_proposal(assignments)` |
+| 完整部署 | `{"nest_ids":["a"],"assignments":{...}}` | `deployment(proposal)`、`remember(proposal)`、最终返回 |
+| 评价字典 | `{"feasible":true,"objectives":[...]}` | `checked["feasible"]`、`checked["objectives"][0]` |
+
+`make_proposal()`与`assignments_from_proposal()`返回深拷贝，仅组织和检查结构，不补齐任务、不修复物理违规。`best()`返回保存的完整部署副本或`None`；`remember()`返回布尔值；`remaining()`使用`remaining()["seconds"]`等字符串字段读取。
+
+类型、字段或调用参数错误报`ToolContractError`；不能用`region(...)[0]`、`remaining().get(0)`等元组式读取。正常的目标列表整数索引和`.get("可选字段", default)`仍可用。不将列表、字典、整数ID强制转字符串，也不取列表首元素掩盖错误。
+
+工具先将错误记录到执行器，再抛异常。候选即使捕获异常、返回可行部署或提前保存可行解，本次仍记为`tool_contract_error`，不能进入档案、没有有效目标及正奖励。无接口错误的预算退出仍可按原规则返回显式保存的解。结构正确但缺任务、机巢未归属自身、超半径或超续航仍属于普通不可行，不误报为类型错误。其他内部异常保留真实类别，不一概转成契约错误。
+
+控制台和`search.log`会立即显示工具名、字段、期望类型、实际类型及可取得的候选行号；逐轮JSON保存错误总数和最早5条详情，修复提示仅取最早3条去重诊断与简短正确示例。错误后硬超时仍保留接口诊断与`hard_timeout`记录；被杀死前只能观测到的错误数明确标为下界。`trajectory.csv`另列状态、契约错误数、约束预检和中断检查耗时；这些不混入部署算法的运行时间。
+
+三份用户失败源码以原始字节Base64与SHA256保存在`tests/fixtures/tool_contract_failures.json`，只用于只读回归，不作为初始候选或手工修好的“搜索成功”。字典守卫不承诺追踪任意Python行为，例如显式复制为普通`dict`后的读取；最终结构检查和独立物理验算仍然必需。执行器也不是OS级安全沙箱。
+
+新运行元数据记录`tool_contract_version=2`。实现和提示词指纹已改变，旧实验只能读取，不能直接恢复；冻结数据和配置保持不变。旧导出包使用原工具快照，执行器按工具版本走兼容分支，不改写旧快照。新导出包仍只需原六个运行时模块，包含新增辅助接口、异常和结果对象。
+
+先离线检查（不调用API）：
+
+```bash
+python -m pip install -r "stage1+llm/requirements-dev.txt"
+python -u -m unittest discover -s "stage1+llm/tests" -p "test_*.py" -v
+python -u "stage1+llm/run.py" smoke-test --run-id offline-check-contract-v2
+```
+
+同步代码并保留服务器的私密API配置后，新建3轮后台试跑（会产生API费用；不要同时写同一run目录）：
+
+```bash
+mkdir -p "stage1+llm/outputs/console" && nohup python -u "stage1+llm/run.py" optimize --search-config "stage1+llm/config/search-v4.json" --run-id trial-v4-contract --evaluation-budget 3 --no-improvement-limit 3 --thinking disabled --max-tokens 8192 --api-retries 0 --stream --show-code > "stage1+llm/outputs/console/trial-v4-contract_$(date +%Y%m%d_%H%M%S).log" 2>&1 < /dev/null &
+```
+
+```bash
+tail -f "stage1+llm/outputs/trial-v4-contract/search.log"
+python -u "stage1+llm/run.py" list-candidates --run-id trial-v4-contract
+```
+
+若该目录已存在，换一个新run ID及对应日志名，不覆盖旧结果。只有试跑产生可行候选且没有持续接口错误后，再用新run ID开启40轮搜索；接口修复不保证LLM一定生成好算法。
