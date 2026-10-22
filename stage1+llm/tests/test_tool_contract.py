@@ -478,7 +478,7 @@ def solve(turbines,config,seed):
             selection = json.loads(
                 (target / "selection.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(selection["run_identity"]["tool_contract_version"], 2)
+            self.assertEqual(selection["run_identity"]["tool_contract_version"], 3)
             command = [
                 sys.executable,
                 "-I",
@@ -490,7 +490,7 @@ def solve(turbines,config,seed):
                 command, capture_output=True, text=True, encoding="utf-8"
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertEqual(json.loads(proc.stdout)["telemetry"]["tools_version"], 2)
+            self.assertEqual(json.loads(proc.stdout)["telemetry"]["tools_version"], 3)
             # Synthetic bundle replacement uses frozen v1 source, not a live old run.
             fixture = json.loads(
                 (Path(__file__).parent / "fixtures/legacy_runtime_v1.json").read_text(

@@ -16,7 +16,7 @@ import numpy as np
 from .domain import DeploymentConfig, Turbine, effective_service_radius_km
 from .routing import directed_times, proxy_route
 
-TOOLS_VERSION = 2
+TOOLS_VERSION = 3
 PUBLIC_METHODS = (
     "distance",
     "directed_time",
@@ -31,7 +31,141 @@ PUBLIC_METHODS = (
     "stats",
     "make_proposal",
     "assignments_from_proposal",
+    "repartition_repair",
+    "objective_dominates",
+    "prefer_objectives",
 )
+
+# Signatures are taken from executable methods; semantic schemas remain explicit.
+_TOOL_NOTES = {
+    "distance": "两个参数都是输入风机ID字符串，不是坐标tuple或风机对象；单位km。例distance(t1.identifier,t2.identifier)。",
+    "directed_time": "两个参数都是输入风机ID字符串，不是坐标；返回有向秒，反向可不同。",
+    "region": "members为含机巢的ID序列/集合。返回字典feasible,diagnostics,task_count；合法成员时另有energy_seconds等。proxy=True且可行才有代理航时，粗筛显式proxy=False。",
+    "deployment": "proposal恰有nest_ids:list[str]及assignments:dict[str,str]。返回字典feasible,diagnostics,regions,objectives；objectives仅可行且proxy=True时为三元素列表，否则None。",
+    "tick": "邻域尝试计数；正整数count，预算耗尽抛BudgetExceeded。",
+    "remaining": "返回字典seconds,region_evaluations,move_attempts；用remaining()['seconds']，不能[0]。",
+    "phase": "报告阶段字符串，仅诊断，不证明实际进行了优化。",
+    "remember": "输入完整proposal，返回bool；独立审核后保存显式选择的可行解，不自动比较质量。",
+    "best": "返回已保存完整proposal深拷贝或None。",
+    "stats": "返回工具实际观测的计数/阶段/错误字典；不是优化成功证明。",
+    "make_proposal": "输入dict[str,str]完整归属，返回完整proposal深拷贝；不补齐/修复物理违规。",
+    "assignments_from_proposal": "输入完整proposal，返回归属映射深拷贝，不是完整部署。",
+    "split_repair": "旧修复原语：输入完整归属，返回完整proposal；逐个打开单点巢，可能产生大量零任务区域，不是优化器。",
+    "repartition_repair": "可选新修复原语：输入完整归属，保留可行区域，将违规区域重分配到逐步新增的机巢，每次加入任务按原保守约束审核。返回完整proposal，不自动保存、不自动继续优化、不保证最优。",
+    "objective_dominates": "输入两个有限三元素目标列表；返回first是否Pareto支配second（全部不差且至少一项更好）。",
+    "prefer_objectives": "三目标内部偏好：必须显式给非负weights及正scales，各长3；先比较支配关系，折中时比较sum(weights[i]*objective[i]/scales[i])，相等保留旧解。不影响外部三目标/Pareto选档。",
+}
+
+
+def tool_reference(names=None) -> str:
+    """Render the same API metadata for initial and targeted repair prompts."""
+    rows = []
+    for name in PUBLIC_METHODS if names is None else names:
+        signature = inspect.signature(getattr(CandidateTools, name))
+        signature = signature.replace(
+            parameters=list(signature.parameters.values())[1:]
+        )
+        rows.append(f"- {name}{signature}: {_TOOL_NOTES[name]}")
+    return "\n".join(rows)
+
+
+def deployment_quality(task_counts, turbine_count: int, telemetry: dict) -> dict:
+    """Descriptive diagnostics only: never feasibility or a fourth objective."""
+    loads = list(task_counts)
+    zeros = sum(t == 0 for t in loads)
+    average = sum(loads) / len(loads) if loads else 0.0
+    flags = ["zero_task_regions_present"] if zeros else []
+    observable = telemetry.get("tools_version", 0) >= 3
+    if observable and telemetry.get("repair_completed_count", 0):
+        if not telemetry.get("post_repair_evaluation_calls", 0):
+            flags.append(
+                "repair_return_without_external_checks"
+                if telemetry.get("termination") == "returned"
+                else "repair_exit_without_external_checks"
+            )
+    return {
+        "region_task_counts": loads,
+        "zero_task_regions": zeros,
+        "zero_task_fraction": zeros / len(loads) if loads else 0.0,
+        "nest_fraction": len(loads) / turbine_count,
+        "maximum_region_tasks": max(loads, default=0),
+        "task_imbalance_cv": (
+            math.sqrt(sum((t - average) ** 2 for t in loads) / len(loads)) / average
+            if average
+            else 0.0
+        ),
+        "repair_observability": "available" if observable else "unavailable",
+        "repair_calls": (
+            copy.deepcopy(telemetry.get("repair_calls")) if observable else None
+        ),
+        "post_repair_evaluation_calls": (
+            telemetry.get("post_repair_evaluation_calls") if observable else None
+        ),
+        "changed_feasible_saves_after_repair": (
+            telemetry.get("changed_feasible_saves_after_repair") if observable else None
+        ),
+        "flags": flags,
+        "note": "Tool-observed checks/changed saves do not prove objective improvement; zero-task regions may be necessary.",
+    }
+
+
+def quality_summary(records: list[dict], expected: dict | None = None) -> dict:
+    """Keep split-level quality and coverage separate from Pareto objectives."""
+    result = {}
+    for split in [
+        "all",
+        *sorted({r.get("split", "unspecified") for r in records} | set(expected or {})),
+    ]:
+        rows = (
+            records
+            if split == "all"
+            else [r for r in records if r.get("split", "unspecified") == split]
+        )
+        valid = [r for r in rows if r.get("feasible") and r.get("metrics")]
+        qualities = [r["quality"] for r in valid if r.get("quality")]
+        result[split] = {
+            "covered_instances": len(rows),
+            "feasible_instances": len(valid),
+            "expected_instances": (
+                (sum(expected.values()) if split == "all" else expected.get(split, 0))
+                if expected
+                else len(rows)
+            ),
+            "mean_nest_count": (
+                sum(r["metrics"]["nest_count"] for r in valid) / len(valid)
+                if valid
+                else None
+            ),
+            "mean_total_proxy_flight_seconds": (
+                sum(r["metrics"]["total_proxy_flight_seconds"] for r in valid)
+                / len(valid)
+                if valid
+                else None
+            ),
+            "maximum_region_tasks": max(
+                (r["metrics"]["maximum_region_tasks"] for r in valid), default=None
+            ),
+            "mean_zero_task_fraction": (
+                sum(q["zero_task_fraction"] for q in qualities) / len(qualities)
+                if qualities
+                else None
+            ),
+            "repair_observable_instances": sum(
+                q["repair_observability"] == "available" for q in qualities
+            ),
+            "repair_without_followup_instances": sum(
+                "repair_return_without_external_checks" in q["flags"] for q in qualities
+            ),
+            "worst_zero_task_instances": [
+                r["name"]
+                for r in sorted(
+                    valid,
+                    key=lambda r: r.get("quality", {}).get("zero_task_fraction", 0),
+                    reverse=True,
+                )[:3]
+            ],
+        }
+    return result
 
 
 class BudgetExceeded(RuntimeError):
@@ -138,6 +272,44 @@ class CandidateTools:
         self._candidate_filename = candidate_filename
         self._contract_error_count = 0
         self._contract_errors: list[dict] = []
+        self._repair_calls = {"split_repair": 0, "repartition_repair": 0}
+        self._repair_completed_count = 0
+        self._last_repair_proposal = None
+        self._post_repair_evaluation_calls = 0
+        self._changed_saves_after_repair = 0
+        self._last_preference: dict | None = None
+
+    def _record_external_call(self, name):
+        # Called by the facade, not internal remember()/repair audit calls.
+        if self._last_repair_proposal is not None and name in ("region", "deployment"):
+            self._post_repair_evaluation_calls += 1
+
+    def _repair_start(self, name):
+        self._repair_calls[name] += 1
+        if self._observer:
+            self._observer(
+                {
+                    "kind": "repair_start",
+                    "tool": name,
+                    "calls": self._repair_calls[name],
+                }
+            )
+
+    def _repair_done(self, name, proposal):
+        self._repair_completed_count += 1
+        self._last_repair_proposal = copy.deepcopy(dict(proposal))
+        self._post_repair_evaluation_calls = 0
+        self._changed_saves_after_repair = 0
+        if self._observer:
+            self._observer(
+                {
+                    "kind": "repair_end",
+                    "tool": name,
+                    "nests": len(proposal["nest_ids"]),
+                    "completed": self._repair_completed_count,
+                }
+            )
+        return self._result(proposal, name)
 
     def _error(self, tool, field, expected, value, code="invalid_shape"):
         line = None
@@ -276,6 +448,11 @@ class CandidateTools:
                 "tools_version": TOOLS_VERSION,
                 "contract_error_count": self._contract_error_count,
                 "contract_errors": copy.deepcopy(self._contract_errors),
+                "repair_calls": dict(self._repair_calls),
+                "repair_completed_count": self._repair_completed_count,
+                "post_repair_evaluation_calls": self._post_repair_evaluation_calls,
+                "changed_feasible_saves_after_repair": self._changed_saves_after_repair,
+                "last_objective_preference": copy.deepcopy(self._last_preference),
             },
             "stats",
         )
@@ -472,7 +649,16 @@ class CandidateTools:
         checked = self.deployment(proposal, proxy=False)
         if not checked["feasible"]:
             return False
+        changed = (
+            self._best is None or self._best["assignments"] != proposal["assignments"]
+        )
         self._best = copy.deepcopy(dict(proposal))
+        if (
+            changed
+            and self._last_repair_proposal is not None
+            and proposal["assignments"] != self._last_repair_proposal["assignments"]
+        ):
+            self._changed_saves_after_repair += 1
         return True
 
     def best(self):
@@ -495,6 +681,7 @@ class CandidateTools:
                 assignments,
                 "repair_precondition",
             )
+        self._repair_start("split_repair")
         answer = dict(assignments)
         for n in set(answer.values()):
             answer[n] = n
@@ -515,7 +702,121 @@ class CandidateTools:
                 answer[opened] = opened
                 break
             else:
-                return self._result(
-                    {"nest_ids": nests, "assignments": answer}, "split_repair"
+                return self._repair_done(
+                    "split_repair", {"nest_ids": nests, "assignments": answer}
                 )
         raise ValueError("Split repair failed to terminate within N openings.")
+
+    def repartition_repair(self, assignments: dict) -> dict:
+        """Repack only infeasible groups; bounded, optional feasibility primitive."""
+        self._assignments_schema("repartition_repair", assignments)
+        if set(assignments) != set(self._by_id) or not set(assignments.values()) <= set(
+            self._by_id
+        ):
+            self._error(
+                "repartition_repair",
+                "assignments",
+                "complete mapping to input turbine IDs",
+                assignments,
+                "repair_precondition",
+            )
+        self._repair_start("repartition_repair")
+        answer = dict(assignments)
+        for nest in set(answer.values()):
+            answer[nest] = nest
+        groups = {
+            n: sorted(t for t in answer if answer[t] == n)
+            for n in sorted(set(answer.values()))
+        }
+        for nest, members in groups.items():
+            if self.region(nest, members, proxy=False)["feasible"]:
+                continue
+            pending = set(members)
+            seed = nest
+            opened = []
+            while pending:
+                self.tick()
+                if not self.region(seed, [seed], proxy=False)["feasible"]:
+                    raise ValueError(
+                        "Even a singleton violates hover/endurance constraints."
+                    )
+                group = [seed]
+                pending.remove(seed)
+                answer[seed] = seed
+                opened.append(seed)
+                for tid in sorted(pending, key=lambda t: (self.distance(seed, t), t)):
+                    self.tick()
+                    if (
+                        self.distance(seed, tid)
+                        > effective_service_radius_km(self._config) + 1e-9
+                    ):
+                        continue
+                    if self.region(seed, group + [tid], proxy=False)["feasible"]:
+                        group.append(tid)
+                        pending.remove(tid)
+                        answer[tid] = seed
+                if pending:
+                    seed = max(
+                        sorted(pending),
+                        key=lambda t: (min(self.distance(t, n) for n in opened), t),
+                    )
+        return self._repair_done(
+            "repartition_repair",
+            {"nest_ids": sorted(set(answer.values())), "assignments": answer},
+        )
+
+    def _objective_vector(self, tool, field, value):
+        valid = isinstance(value, (list, tuple)) and len(value) == 3
+        if valid:
+            try:
+                valid = all(
+                    not isinstance(x, bool)
+                    and isinstance(x, (int, float))
+                    and math.isfinite(x)
+                    for x in value
+                )
+            except OverflowError:
+                valid = False
+        if not valid:
+            self._error(tool, field, "three finite numeric objectives", value)
+        return [float(x) for x in value]
+
+    def objective_dominates(self, first: list, second: list) -> bool:
+        self._check()
+        a = self._objective_vector("objective_dominates", "first", first)
+        b = self._objective_vector("objective_dominates", "second", second)
+        return all(x <= y for x, y in zip(a, b)) and any(x < y for x, y in zip(a, b))
+
+    def prefer_objectives(
+        self, candidate: list, incumbent: list, *, weights: list, scales: list
+    ) -> bool:
+        self._check()
+        a = self._objective_vector("prefer_objectives", "candidate", candidate)
+        b = self._objective_vector("prefer_objectives", "incumbent", incumbent)
+        w = self._objective_vector("prefer_objectives", "weights", weights)
+        s = self._objective_vector("prefer_objectives", "scales", scales)
+        if min(w) < 0 or sum(w) <= 0:
+            self._error(
+                "prefer_objectives", "weights", "nonnegative with positive sum", weights
+            )
+        if min(s) <= 0:
+            self._error("prefer_objectives", "scales", "positive scales", scales)
+        preference = {"weights": list(w), "scales": list(s)}
+        if preference != self._last_preference:
+            self._last_preference = preference
+            if self._observer:
+                self._observer({"kind": "objective_preference", **preference})
+        if self.objective_dominates(a, b):
+            return True
+        if self.objective_dominates(b, a):
+            return False
+        left = sum(wi * ai / si for wi, ai, si in zip(w, a, s))
+        right = sum(wi * bi / si for wi, bi, si in zip(w, b, s))
+        if not math.isfinite(left) or not math.isfinite(right):
+            self._error(
+                "prefer_objectives",
+                "normalized score",
+                "finite weighted scores; choose safe weights/scales",
+                left,
+            )
+        return left < right - 1e-12

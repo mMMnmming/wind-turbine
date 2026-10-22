@@ -23,15 +23,17 @@ def load_state(root: Path) -> dict:
 def list_candidates(root: Path) -> list[dict]:
     rows = load_state(root)["archive"]
     print(
-        "候选 | 平均机巢数 | 平均总飞行时间/s(启发式) | 最大区域任务数 | 三目标",
+        "候选 | 平均机巢数 | 平均总飞行时间/s(启发式) | 最大区域任务数 | 零任务区域比例 | 修复后无后续评价实例 | 三目标",
         flush=True,
     )
     for row in rows:
         summary = row["evaluation"]["aggregate"]
+        quality = row["evaluation"].get("quality_summary", {}).get("all", {})
         print(
             f"{row['candidate_id']} | {summary['mean_nest_count']:.3f} | "
             f"{summary['mean_total_proxy_flight_seconds']:.3f} | {summary['maximum_region_tasks']} | "
-            f"{row['objectives']}",
+            f"{quality.get('mean_zero_task_fraction','N/A')} | "
+            f"{quality.get('repair_without_followup_instances','N/A')} | {row['objectives']}",
             flush=True,
         )
     return rows
@@ -279,6 +281,8 @@ def write_front(root: Path, rows: list[dict]) -> None:
                 "机巢比例",
                 "单位风机飞行时间/s",
                 "最坏任务比例",
+                "平均零任务区域比例",
+                "修复后无后续评价实例数",
             ]
         )
         for row in rows:
@@ -290,5 +294,13 @@ def write_front(root: Path, rows: list[dict]) -> None:
                     aggregate["mean_total_proxy_flight_seconds"],
                     aggregate["maximum_region_tasks"],
                     *row["objectives"],
+                    row["evaluation"]
+                    .get("quality_summary", {})
+                    .get("all", {})
+                    .get("mean_zero_task_fraction"),
+                    row["evaluation"]
+                    .get("quality_summary", {})
+                    .get("all", {})
+                    .get("repair_without_followup_instances"),
                 ]
             )

@@ -13,7 +13,13 @@ import time
 
 from .artifacts import RunArtifacts, run_path, safe_child, redact_secrets
 from .candidate import CANDIDATE_BUILTINS, validate_candidate_source
-from .candidate_tools import TOOLS_VERSION
+from .candidate_tools import (
+    TOOLS_VERSION,
+    PUBLIC_METHODS,
+    deployment_quality,
+    quality_summary,
+    tool_reference,
+)
 from .client import DeepSeekClient, DeepSeekSettings
 from .data import fingerprint, prepare_data, turbines_from_record
 from .domain import Turbine, result_as_dict, effective_service_radius_km
@@ -368,13 +374,46 @@ class SearchController:
                         "metrics": _diagnostic_metrics(r, metric_keys),
                         "violations": list(dict.fromkeys(r.get("violations", [])))[:4],
                         "diagnostics": r.get("diagnostics", [])[:4],
+                        "quality": {
+                            key: value
+                            for key, value in (r.get("quality") or {}).items()
+                            if key
+                            in (
+                                "zero_task_fraction",
+                                "flags",
+                                "post_repair_evaluation_calls",
+                                "repair_observability",
+                            )
+                        },
                     }
                     for r in sorted(
                         parent["evaluation"].get("datasets", []),
-                        key=lambda d: d["feasible"],
+                        key=lambda d: (
+                            d["feasible"],
+                            -(d.get("quality") or {}).get("zero_task_fraction", 0),
+                            -d.get("metrics", {}).get("nest_count", 0)
+                            / max(1, d.get("turbine_count", 1)),
+                        ),
                     )[: self.settings.feedback_dataset_limit]
                 ],
                 "aggregate": parent["evaluation"].get("aggregate"),
+                "quality_summary": {
+                    split: {
+                        key: value
+                        for key, value in summary.items()
+                        if key
+                        in (
+                            "covered_instances",
+                            "expected_instances",
+                            "mean_nest_count",
+                            "mean_zero_task_fraction",
+                            "repair_without_followup_instances",
+                        )
+                    }
+                    for split, summary in parent["evaluation"]
+                    .get("quality_summary", {})
+                    .items()
+                },
                 "diagnostics": parent["evaluation"].get("diagnostics", [])[:4],
             }
             if (
@@ -414,9 +453,33 @@ class SearchController:
             # repeat it in diagnostics, violations and a full traceback.
             feedback["parent_diagnostic"].pop("diagnostics", None)
             feedback["parent_diagnostic"].pop("violations", None)
-            feedback["tool_contract_example"] = (
-                'proposal=make_proposal(assignments); checked=deployment(proposal,proxy=True); checked["feasible"]; checked["objectives"]; remaining()["seconds"]; remember(proposal); return proposal'
+            names = list(
+                dict.fromkeys(
+                    d.get("tool") for d in unique if d.get("tool") in PUBLIC_METHODS
+                )
             )
+            feedback["targeted_tool_reference"] = tool_reference(
+                names[:3] or ["make_proposal", "deployment"]
+            )
+            source_lines = (
+                (artifacts.root / parent["source_path"])
+                .read_text(encoding="utf-8")
+                .splitlines()
+            )
+            feedback["error_context"] = [
+                {
+                    "tool": d["tool"],
+                    "lines": [
+                        f"{i+1}: {source_lines[i]}"
+                        for i in range(
+                            max(0, d["candidate_line"] - 3),
+                            min(len(source_lines), d["candidate_line"] + 2),
+                        )
+                    ],
+                }
+                for d in unique[:3]
+                if isinstance(d.get("candidate_line"), int)
+            ]
         text = json.dumps(
             feedback, ensure_ascii=False, separators=(",", ":"), default=str
         )
@@ -436,6 +499,13 @@ class SearchController:
             "max_region_evaluations": self.settings.max_region_evaluations,
             "max_move_attempts": self.settings.max_move_attempts,
         }
+
+    def _expected_splits(self) -> dict:
+        expected: dict[str, int] = {}
+        for record in self.bundle["datasets"]:
+            split = record["split"]
+            expected[split] = expected.get(split, 0) + 1
+        return expected
 
     def _constraint_preflight(self, artifacts, row, source_path):
         if not self.settings.constraint_preflight:
@@ -733,6 +803,13 @@ class SearchController:
                 "algorithm_seconds": algorithm_seconds,
                 "diagnostics": list(checked.diagnostics),
                 "telemetry": telemetry,
+                "quality": (
+                    deployment_quality(
+                        checked.metrics.region_task_counts, len(turbines), telemetry
+                    )
+                    if checked.feasible
+                    else None
+                ),
                 "evaluation_seconds": checked_seconds,
                 "proposal": asdict(proposal),
                 "recomputed_deployment": (
@@ -751,6 +828,10 @@ class SearchController:
                 f"algorithm={algorithm_seconds:.3f}s evaluator={checked_seconds:.3f}s "
                 f"violations={'; '.join(checked.violations) or 'none'} work={telemetry}",
                 event="dataset_end",
+            )
+            artifacts.log(
+                f"{row['candidate_id']} dataset={record['name']} quality={data['quality']}",
+                event="quality_diagnostic",
             )
             if not checked.feasible and self.settings.early_rejection:
                 break
@@ -779,6 +860,7 @@ class SearchController:
             ],
         }
         result.update(
+            quality_summary=quality_summary(datasets, self._expected_splits()),
             evaluated_count=len(datasets),
             total_count=len(self.bundle["datasets"]),
             complete=len(datasets) == len(self.bundle["datasets"]),
@@ -820,6 +902,10 @@ class SearchController:
         return result
 
     def _finish(self, artifacts: RunArtifacts, row: dict, evaluation: dict) -> None:
+        evaluation.setdefault(
+            "quality_summary",
+            quality_summary(evaluation.get("datasets", []), self._expected_splits()),
+        )
         before = {tuple(r["objectives"]) for r in self.archive}
         evaluation["source_sha256"] = row.get("source_sha256")
         row["evaluation"] = evaluation
@@ -893,6 +979,34 @@ class SearchController:
         )
 
     def _reports(self, artifacts: RunArtifacts) -> None:
+        artifacts.write_json(
+            "quality_report.json",
+            {
+                "note": "Descriptive diagnostics only; legal singleton regions remain Pareto-eligible. Observed checks are not proof of improvement.",
+                "candidates": [
+                    {
+                        "candidate_id": r["candidate_id"],
+                        "status": r["evaluation"]["status"],
+                        "quality_summary": r["evaluation"].get("quality_summary", {}),
+                    }
+                    for r in self.history
+                ],
+            },
+        )
+        quality_rows = [
+            dict(candidate_id=r["candidate_id"], split=split, **q)
+            for r in self.history
+            for split, q in r["evaluation"].get("quality_summary", {}).items()
+        ]
+        if quality_rows:
+            with (artifacts.root / "quality_summary.csv").open(
+                "w", encoding="utf-8-sig", newline=""
+            ) as handle:
+                quality_writer = csv.DictWriter(
+                    handle, fieldnames=list(quality_rows[0])
+                )
+                quality_writer.writeheader()
+                quality_writer.writerows(quality_rows)
         write_front(artifacts.root, self.archive)
         groups = {}
         for row in self.history:
@@ -977,6 +1091,11 @@ class SearchController:
     ) -> Path:
         self.bundle = prepare_data(self.settings)
         system = (PROMPTS / "system.md").read_text(encoding="utf-8")
+        system += (
+            "\n以下接口签名直接从执行方法生成，语义与执行器版本一致：\n"
+            + tool_reference()
+            + "\n"
+        )
         system += (
             "\n执行器支持的内置名称仅为："
             + ", ".join(sorted(CANDIDATE_BUILTINS))

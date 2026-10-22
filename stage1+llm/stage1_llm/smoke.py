@@ -17,11 +17,24 @@ from .settings import REPO_ROOT, SearchSettings
 SOLO = "def solve(turbines, config, seed):\n return {'nest_ids':[t.identifier for t in turbines], 'assignments':{t.identifier:t.identifier for t in turbines}}\n"
 GROUP = "def solve(turbines, config, seed):\n n=turbines[0].identifier\n return {'nest_ids':[n], 'assignments':{t.identifier:n for t in turbines}}\n"
 BROKEN = "def solve(turbines, config, seed):\n return {'nest_ids':[turbines[0].identifier], 'assignments':{}}\n"
-TOOL_GROUP = """from candidate_tools import split_repair, remember, make_proposal, assignments_from_proposal
+TOOL_GROUP = """from candidate_tools import repartition_repair, remember, make_proposal, assignments_from_proposal, deployment, prefer_objectives, tick
 def solve(turbines, config, seed):
     initial = make_proposal({t.identifier:turbines[0].identifier for t in turbines})
-    answer = split_repair(assignments_from_proposal(initial))
+    answer = repartition_repair(assignments_from_proposal(initial))
     remember(answer)
+    checked = deployment(answer,proxy=True)
+    # Offline fixture only: one explicit neighbor, not a research algorithm.
+    if len(turbines)>1:
+        tick()
+        mapping = assignments_from_proposal(answer)
+        tid = turbines[-1].identifier
+        mapping[tid] = tid
+        neighbor = make_proposal(mapping)
+        scored = deployment(neighbor,proxy=True)
+        if scored['feasible'] and prefer_objectives(scored['objectives'],checked['objectives'],
+            weights=[1,1,2],scales=[1,config.max_endurance_seconds/len(turbines),1]):
+            answer = neighbor
+            remember(answer)
     return answer
 """
 

@@ -52,7 +52,9 @@ def bind_tool(name):
         try: signature.bind(*args,**kwargs)
         except TypeError:
             tools._error(name,'arguments',str(signature),kwargs,'invalid_arguments')
-        return method(*args,**kwargs)
+        result=method(*args,**kwargs)
+        if contract_version>=3: tools._record_external_call(name)
+        return result
     return invoke
 for name in PUBLIC_METHODS: setattr(facade,name,bind_tool(name))
 facade.BudgetExceeded=BudgetExceeded

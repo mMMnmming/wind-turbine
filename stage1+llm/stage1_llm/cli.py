@@ -23,6 +23,7 @@ from .exports import (
 )
 from .plotting import write_deployment_figure
 from .sandbox import run_candidate
+from .candidate_tools import deployment_quality
 from .search import SearchController
 from .settings import load_deepseek_settings, load_search_settings
 
@@ -262,6 +263,13 @@ def main(argv: list[str] | None = None) -> int:
             ):
                 checked = evaluate_proposal(turbines, settings.deployment, proposal)
             evaluation_seconds = time.perf_counter() - start
+            quality = (
+                deployment_quality(
+                    checked.metrics.region_task_counts, len(turbines), telemetry
+                )
+                if checked.feasible
+                else None
+            )
             source = {
                 "kind": "stage1_llm_program_evaluation",
                 **provenance,
@@ -274,6 +282,7 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "feasible": checked.feasible,
                     "metrics": asdict(checked.metrics),
+                    "quality": quality,
                     "violations": checked.violations,
                     "algorithm_seconds": algorithm_seconds,
                     "evaluation_seconds": evaluation_seconds,
@@ -290,7 +299,7 @@ def main(argv: list[str] | None = None) -> int:
                 artifacts.log(
                     f"PASS nests={checked.metrics.nest_count} proxy_flight={checked.metrics.total_proxy_flight_seconds:.3f}s "
                     f"max_tasks={checked.metrics.maximum_region_tasks} algorithm={algorithm_seconds:.3f}s "
-                    f"evaluator={evaluation_seconds:.3f}s output={artifacts.root}",
+                    f"evaluator={evaluation_seconds:.3f}s quality={quality} output={artifacts.root}",
                     event="evaluation_end",
                 )
                 return 0

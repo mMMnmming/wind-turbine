@@ -8,6 +8,7 @@ from .artifacts import RunArtifacts, run_path, sha256_file
 from .data import prepare_data, turbines_from_record
 from .evaluator import evaluate_proposal
 from .sandbox import run_candidate
+from .candidate_tools import deployment_quality, quality_summary
 
 
 def benchmark(settings, outputs: Path, run_id: str, candidates: list[Path]) -> Path:
@@ -62,6 +63,14 @@ def benchmark(settings, outputs: Path, run_id: str, candidates: list[Path]) -> P
                     "algorithm_seconds": elapsed,
                     "evaluation_seconds": time.perf_counter() - check_start,
                     "telemetry": telemetry,
+                    "split": record["split"],
+                    "quality": (
+                        deployment_quality(
+                            checked.metrics.region_task_counts, len(points), telemetry
+                        )
+                        if checked.feasible
+                        else None
+                    ),
                 }
             except Exception as error:
                 row = {
@@ -70,11 +79,13 @@ def benchmark(settings, outputs: Path, run_id: str, candidates: list[Path]) -> P
                     "error": f"{type(error).__name__}: {error}",
                     "algorithm_seconds": time.perf_counter() - started,
                     "telemetry": telemetry,
+                    "split": record["split"],
+                    "status": getattr(error, "status", "algorithm_error"),
                 }
             rows.append(row)
             artifacts.log(
                 f'{candidate.name} dataset={record["name"]} feasible={row["feasible"]} '
-                f'algorithm={row["algorithm_seconds"]:.3f}s metrics={row.get("metrics")} error={row.get("error")}',
+                f'algorithm={row["algorithm_seconds"]:.3f}s metrics={row.get("metrics")} quality={row.get("quality")} error={row.get("error")}',
                 event="benchmark_dataset",
             )
             artifacts.write_json(
@@ -93,6 +104,7 @@ def benchmark(settings, outputs: Path, run_id: str, candidates: list[Path]) -> P
             "datasets": rows,
             "feasible": feasible,
             "algorithm_seconds": sum(r["algorithm_seconds"] for r in rows),
+            "quality_summary": quality_summary(rows),
         }
         if feasible:
             result["objectives"] = [

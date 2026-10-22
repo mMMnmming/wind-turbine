@@ -172,3 +172,66 @@ python -u "stage1+llm/run.py" list-candidates --run-id trial-v4-contract
 ```
 
 若该目录已存在，换一个新run ID及对应日志名，不覆盖旧结果。只有试跑产生可行候选且没有持续接口错误后，再用新run ID开启40轮搜索；接口修复不保证LLM一定生成好算法。
+
+## 9. 质量增强：工具 v3（推荐新实验使用本节）
+
+根据真实`trial-v4-contract`修复：C0002已能运行，但大量实例退化为“一个大区域＋很多单点巢”；C0003在部分拓扑正常优化，另一些在修复后直接返回。此次不改变物理约束、外部三目标、Pareto入档、UCB及Stage2，不把质量诊断当成第四个目标或新的物理硬约束。
+
+### 本次改动
+
+- 旧`split_repair(assignments)`保留原语义；新增显式可选`repartition_repair(assignments)`。只重建违规区域，按原保守审核增量吸收附近任务、逐步打开新巢，保留原本可行区域。它是手写工程启发式，不保证机巢更少或全局最优，不自动保存、不替LLM继续优化；预算耗尽仍遵守原规则。
+- 提示词要求初始构造同时考虑半径/续航，机巢数量自适应；修复得到可行解后先remember，再进入候选自己的有界搜索。框架不会替候选补一段隐藏优化，也不因单点机巢合法存在而拒绝入档。新LLM是否实际遵循，需要真实试跑验证。
+- 新增`objective_dominates(a,b)`及`prefer_objectives(candidate,incumbent,weights=...,scales=...)`。后者必须显式给三维权重/尺度，先按Pareto支配、折中时按归一化加权和比较，相等保留旧解。实际权重/尺度写入日志和telemetry；只是候选内部偏好，不能改变外部三目标或自动替用户选“最好”。不是论文原参数。
+- 工具签名从实际方法生成，字段语义共用一处说明；距离工具明确只收风机ID字符串。修复反馈按错误工具补短说明和出错行附近源码，保留完整父代代码但不重复整段堆栈；质量反馈只保留紧凑指标，不把长区域列表反复送给LLM。
+
+### 看什么日志和结果
+
+控制台及`search.log`增加`repair_start`、`repair_end`、`objective_preference`、`quality_diagnostic`，保留公开LLM流式输出、完整源码、心跳、预检和逐实例验算。
+
+每实例`quality`记录任务分布、零非机巢任务区域比例、任务数变异系数、修复工具调用、最后一次成功修复后的外部评价调用数及不同可行归属的保存次数。`remember()`内部审核不冒充修复后的外部搜索评价。检查过不同解或保存过不同解，都不等于目标一定改善；单改phase名字也不算证明。
+
+- `zero_task_regions_present`：有仅含机巢自身的区域，可能合理，不代表漏覆盖或不可行。
+- `repair_return_without_external_checks`：正常返回，但最后成功修复后未观察到候选调用region/deployment；提示可能直接交付修复解，不作为可行性否决。
+- `repair_exit_without_external_checks`：预算等退出时未观察到后续评价，不能直接指责为提前放弃优化。
+- 旧工具快照没有新计数时，标记`repair_observability=unavailable`，不估算历史搜索次数。
+
+新增`quality_report.json`、`quality_summary.csv`；训练/验证分别及全部实例汇总，标出已覆盖/应覆盖/可行数量，失败或未覆盖不虚构通过。`evaluations/*.json`保留逐实例完整质量记录，`pareto.csv`和`list-candidates`补充零任务区域及修复后无后续评价数量。反馈优先展示不可行及质量退化实例，合法的折中方案仍完整保留。
+
+工具版本升为3，搜索CLI/配置入口保持不变；旧运行可读、旧导出仍使用旧快照，但指纹改变后不能恢复旧搜索。使用新run ID，冻结数据仍沿用`prepared-v4`，不得清空或覆盖以掩盖差异。
+
+### 先离线测试与对照（无API费用）
+
+```bash
+python -m pip install -r "stage1+llm/requirements-dev.txt"
+python -u -m unittest discover -s "stage1+llm/tests" -p "test_*.py" -v
+python -u "stage1+llm/run.py" smoke-test --run-id offline-quality-v3
+```
+
+以下命令在同一冻结102及16个KDE实例上比较旧/新修复工具和原始C0002/C0003，不运行87，不调用LLM，结果不能冒充新LLM算法成绩：
+
+```bash
+python -u "stage1+llm/run.py" benchmark --search-config "stage1+llm/config/search-v4.json" --candidate "stage1+llm/baselines/quality/split_only.py" --candidate "stage1+llm/baselines/quality/repartition_only.py" --candidate "stage1+llm/baselines/trial-contract/C0002.py" --candidate "stage1+llm/baselines/trial-contract/C0003.py" --run-id quality-baseline-v3
+```
+
+输出`outputs/quality-baseline-v3/benchmark.json`。四个程序共享该文件记录的数据指纹；若与历史服务器试跑指纹不同，不宣称是同一历史数据的直接数值复现。旧/新工具都用同一硬约束验算；不得仅凭更低飞行时间忽略机巢数增加。
+
+### 服务器后台试跑6轮（调用收费API）
+
+代码同步并保留本机私密配置后，从仓库根目录执行：
+
+```bash
+mkdir -p "stage1+llm/outputs/console" && nohup python -u "stage1+llm/run.py" optimize --search-config "stage1+llm/config/search-v4.json" --run-id trial-v4-quality-v3 --evaluation-budget 6 --no-improvement-limit 6 --thinking disabled --max-tokens 8192 --api-retries 0 --stream --show-code > "stage1+llm/outputs/console/trial-v4-quality-v3_$(date +%Y%m%d_%H%M%S).log" 2>&1 < /dev/null &
+```
+
+```bash
+tail -f "stage1+llm/outputs/trial-v4-quality-v3/search.log"
+python -u "stage1+llm/run.py" list-candidates --run-id trial-v4-quality-v3
+```
+
+6是逻辑轮数，失败仍占轮次；初始生成和强制修复不作为普通UCB优化证据。应检查是否出现非修复的父代优化轮，以及全部实例可行、单点巢比例、最差实例和三目标折中，不能仅看“前沿有候选”。试跑质量稳定后才新建40轮正式实验，勿按87成绩反复挑选。
+
+同一新版本正常中断可恢复，不要同时写同一目录：
+
+```bash
+mkdir -p "stage1+llm/outputs/console" && nohup python -u "stage1+llm/run.py" resume --search-config "stage1+llm/config/search-v4.json" --resume-run-id trial-v4-quality-v3 --thinking disabled --max-tokens 8192 --api-retries 0 --stream --show-code > "stage1+llm/outputs/console/resume-quality-v3_$(date +%Y%m%d_%H%M%S).log" 2>&1 < /dev/null &
+```
