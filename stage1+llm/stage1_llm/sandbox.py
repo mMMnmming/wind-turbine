@@ -15,6 +15,10 @@ from .candidate import CANDIDATE_BUILTINS, CandidateProposal, validate_candidate
 from .domain import DeploymentConfig, Turbine
 
 
+class CandidateDeadlineExceeded(TimeoutError):
+    """Candidate budget exhausted while a trusted oracle request is in flight."""
+
+
 class CandidateExecutionError(RuntimeError):
     """Execution failure with structured diagnostics retained across processes."""
 
@@ -32,15 +36,28 @@ class CandidateExecutionError(RuntimeError):
 
 _WORKER = r"""import json,math,random,itertools,collections,typing,sys,builtins,inspect
 from types import SimpleNamespace,ModuleType
-data=json.load(sys.stdin)
+data=json.loads(sys.stdin.readline())
 sys.path.insert(0,data['runtime'])
 from stage1_llm.candidate_tools import CandidateTools,BudgetExceeded,PUBLIC_METHODS
 import stage1_llm.candidate_tools as tool_runtime
 from stage1_llm.domain import DeploymentConfig,Turbine
+if data.get('joint'):
+    sys.path.insert(0,data['repo_root'])
+    import stage1_llm.joint_tools as tool_runtime
+    from stage1_llm.joint_tools import JointTools as CandidateTools,PUBLIC_METHODS
+    class RemotePlanner:
+        metadata={'environment':data['environment']}
+        def region(self,points,nest):
+            request={'nest':nest,'members':[p.identifier for p in points]}
+            sys.stderr.write('STAGE1_ORACLE '+json.dumps(request,allow_nan=False)+'\n');sys.stderr.flush()
+            response=json.loads(sys.stdin.readline())
+            if not response.get('ok'): raise RuntimeError('Trusted oracle failed')
+            return response['result']
 def progress(row):
     sys.stderr.write('STAGE1_TOOLS '+json.dumps(row,allow_nan=False)+'\n');sys.stderr.flush()
 contract_version=getattr(tool_runtime,'TOOLS_VERSION',1)
 extra={'candidate_filename':sys.argv[1]} if contract_version>=2 else {}
+if data.get('joint'): extra['planner']=RemotePlanner()
 tools=CandidateTools([Turbine(**t) for t in data['turbines']],DeploymentConfig(**data['config']),
                      observer=progress,**data['limits'],**extra)
 facade=ModuleType('candidate_tools')
@@ -74,7 +91,9 @@ class TurbineInput(dict):
     @property
     def y_km(self): return self['y_km']
 C=SimpleNamespace(**data['config'])
+if data.get('joint'): C.gust_speed_mps=data['environment']['gust_speed_mps']
 config_fields=frozenset(data['config'])
+if data.get('joint'): config_fields=config_fields|frozenset(('gust_speed_mps',))
 turbine_fields=frozenset(('identifier','x_km','y_km'))
 missing=object()
 def public_getattr(obj,name,default=missing):
@@ -143,14 +162,17 @@ def _runtime(source_path: Path) -> Path:
                     raise ValueError("Unsafe runtime manifest.")
                 if hashlib.sha256(target.read_bytes()).hexdigest() != expected:
                     raise ValueError("Exported trusted runtime hash changed.")
-            if set(hashes) != {
+            required = {
                 "__init__.py",
                 "candidate_tools.py",
                 "domain.py",
                 "routing.py",
                 "candidate.py",
                 "sandbox.py",
-            }:
+            }
+            if record.get("search_version") == 5:
+                required |= {"joint_tools.py", "joint_planner.py"}
+            if set(hashes) != required:
                 raise ValueError("Incomplete trusted runtime manifest.")
             return root
     return Path(__file__).resolve().parents[1]
@@ -166,6 +188,7 @@ def run_candidate(
     limits: dict | None = None,
     telemetry: dict | None = None,
     observer=None,
+    planner=None,
 ) -> CandidateProposal:
     source = source_path.read_text(encoding="utf-8")
     validate_candidate_source(source)
@@ -191,6 +214,12 @@ def run_candidate(
         "runtime": str(_runtime(source_path)),
         "limits": effective_limits,
     }
+    if planner is not None:
+        payload.update(
+            joint=True,
+            environment=planner.metadata["environment"],
+            repo_root=str(Path(__file__).resolve().parents[2]),
+        )
     output: list[str] = []
     errors: list[str] = []
     events: queue.Queue[dict] = queue.Queue()
@@ -217,11 +246,46 @@ def run_candidate(
                     events.put_nowait(json.loads(line[len("STAGE1_TOOLS ") :]))
                 except json.JSONDecodeError:
                     sink.append(line)
+            elif observe and line.startswith("STAGE1_ORACLE "):
+                try:
+                    events.put_nowait(
+                        {"oracle_request": json.loads(line[len("STAGE1_ORACLE ") :])}
+                    )
+                except json.JSONDecodeError:
+                    sink.append(line)
             else:
                 sink.append(line)
 
     def handle_event(row):
         nonlocal contract_event_count
+        if "oracle_request" in row:
+            if planner is None:
+                raise ValueError("Unexpected oracle request in legacy candidate")
+            from .joint_planner import PlannerService
+
+            request = row["oracle_request"]
+            by_id = {t.identifier: t for t in turbines}
+            members = request.get("members")
+            if (
+                not isinstance(members, list)
+                or not all(isinstance(m, str) for m in members)
+                or len(members) != len(set(members))
+                or not set(members) <= set(by_id)
+                or request.get("nest") not in members
+            ):
+                raise ValueError("Invalid trusted oracle request")
+            remaining = timeout_seconds - (time.perf_counter() - started)
+            kwargs = (
+                {"timeout": remaining} if isinstance(planner, PlannerService) else {}
+            )
+            result = planner.region(
+                [by_id[m] for m in members], request["nest"], **kwargs
+            )
+            proc.stdin.write(
+                json.dumps({"ok": True, "result": result}, allow_nan=False) + "\n"
+            )
+            proc.stdin.flush()
+            return
         if row.get("kind") == "tool_contract_error":
             contract_event_count += 1
             if len(contract_events) < 5:
@@ -241,8 +305,10 @@ def run_candidate(
     for thread in threads:
         thread.start()
     try:
-        proc.stdin.write(json.dumps(payload, allow_nan=False))
-        proc.stdin.close()
+        proc.stdin.write(json.dumps(payload, allow_nan=False) + "\n")
+        proc.stdin.flush()
+        if planner is None:
+            proc.stdin.close()
         while True:
             while not events.empty():
                 row = events.get_nowait()
@@ -261,6 +327,12 @@ def run_candidate(
                 break
             except subprocess.TimeoutExpired:
                 pass
+    except CandidateDeadlineExceeded:
+        timed_out = True
+        if telemetry is not None:
+            telemetry.update(
+                termination="hard_timeout", seconds=time.perf_counter() - started
+            )
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -272,7 +344,13 @@ def run_candidate(
                 pipe.close()
         while not events.empty():
             row = events.get_nowait()
-            handle_event(row)
+            if "oracle_request" not in row:
+                handle_event(row)
+        if timed_out and planner is not None:
+            from .joint_planner import PlannerService
+
+            if isinstance(planner, PlannerService):
+                planner.settle()
     if timed_out:
         if contract_events:
             details = dict(

@@ -173,7 +173,7 @@ python -u "stage1+llm/run.py" list-candidates --run-id trial-v4-contract
 
 若该目录已存在，换一个新run ID及对应日志名，不覆盖旧结果。只有试跑产生可行候选且没有持续接口错误后，再用新run ID开启40轮搜索；接口修复不保证LLM一定生成好算法。
 
-## 9. 质量增强：工具 v3（推荐新实验使用本节）
+## 9. 历史质量增强：工具 v3（旧搜索使用本节，新实验见第10节）
 
 根据真实`trial-v4-contract`修复：C0002已能运行，但大量实例退化为“一个大区域＋很多单点巢”；C0003在部分拓扑正常优化，另一些在修复后直接返回。此次不改变物理约束、外部三目标、Pareto入档、UCB及Stage2，不把质量诊断当成第四个目标或新的物理硬约束。
 
@@ -235,3 +235,97 @@ python -u "stage1+llm/run.py" list-candidates --run-id trial-v4-quality-v3
 ```bash
 mkdir -p "stage1+llm/outputs/console" && nohup python -u "stage1+llm/run.py" resume --search-config "stage1+llm/config/search-v4.json" --resume-run-id trial-v4-quality-v3 --thinking disabled --max-tokens 8192 --api-retries 0 --stream --show-code > "stage1+llm/outputs/console/resume-quality-v3_$(date +%Y%m%d_%H%M%S).log" 2>&1 < /dev/null &
 ```
+
+## 10. 当前版本：含风况Stage2反馈驱动的部署进化（v5）
+
+本节替代新版的三目标Pareto选优。旧实验仍用原配置、结果和工具快照，不会自动变成v5；修改了实现指纹的旧搜索不能直接恢复。所有命令从 `wind-turbine` 仓库根目录执行，只在 `stage1+llm/` 保存新结果。
+
+### 算法逻辑与约束
+
+LLM生成完整 `solve(turbines, config, seed)` → 得到机巢和归属 → 检查覆盖、自身归属、服务半径 → 冻结Stage2单次贪心规划 → 按实际路线计算含风有向飞行时间、返航及续航 → 反馈给LLM迭代。
+
+- 正式权重：`stage2/outputs/finetune-edge-v2/control/best_greedy.pt`。只加载一次，不训练、不采样、不增加后处理，也不回退为最近邻。CPU必须显式指定，CUDA不可用不会静默切换。
+- 默认风速6 m/s、风向90°、阵风特征12 m/s、空速23 m/s、半径7 km、续航2460 s、悬停10 s、等效系数1.14。直接复用Stage2风向转换、特征、有向时间矩阵及路线验算，不另加禁飞方向或阵风动力学。阵风是特征，不是本次新增的随机过程。
+- 删除v5所有工具/修复/最终审核中的最近邻巡检路线与启发式代理。几何距离可辅助分区，不等于使用最近邻路线。续航只按网络实际闭合路线加非机巢任务悬停消耗计算；零外出任务区域飞行及任务悬停均为0。
+- 所有固定实例可行后依次比较：平均机巢数 → 平均全场总飞行秒 → 全部实例中最长区域飞行秒，同分保留较早候选。每实例平均区域飞行秒=`总飞行秒/机巢数`，仅展示，不重复计分。机巢数少绝对优先于飞行时间改善，不是加权或Pareto。
+- 网络未取得可行路线不等于部署已证明无解；结果只能称“固定网络与预算内找到的最佳可执行算法”，没有全局最优证明。
+- 使用102+8训练KDE+8选择验证KDE，沿用冻结数据和种子。选择验证数据会参与反馈，不是独立最终测试；87只能在算法选定后评价。
+
+工具版本4无 `proxy` 参数，也不再暴露 `objective_dominates` / `prefer_objectives`。`region()`始终返回实际网络路线评价；`deployment()`返回 `metrics` 及可行时的 `objectives=[机巢数,总飞行秒,最长区域飞行秒]`；`better_metrics(a,b)`按优先级比较。`remember()`只保存显式选定且可行的方案，不自动选优。工具契约错误即使被候选捕获也使该次执行失败。
+
+保留40轮预算、3个独立初始候选、连续10轮最佳无改善停止。父代池最多6个，70%选最佳、30%选其余高排名方案，失败修复和UCB方向选择保留。软预算120秒（含推理等待）、硬超时300秒、未缓存区域评价5000次、动作尝试20000次。失败仍占逻辑轮数，SDK请求重试与逻辑轮次分开；模型/显存/服务故障停止并保留pending源码，不自动增加API请求。
+
+### 环境与离线检查（不收费）
+
+先激活服务器已有的CUDA版PyTorch环境，不通过下面依赖安装强制替换PyTorch。配置私密DeepSeek文件，勿提交密钥。
+
+```bash
+python -c "import torch; print(torch.__version__); print(torch.cuda.is_available())"
+python -m pip install -r "stage1+llm/requirements-dev.txt"
+python -u -m unittest discover -s "stage1+llm/tests" -p "test_*.py" -v
+python -u "stage1+llm/run.py" smoke-test --run-id offline-joint-v5
+```
+
+测试中的微型随机权重和模拟规划器不是正式模型，也不能证明部署性能。冒烟流程明确标记 `offline_mock`，覆盖错误、修复、去重、六轮搜索、恢复及导出，不调用API。已有同名目录时更换run ID，不覆盖旧结果。
+
+正式模型在启动搜索时先检查文件、架构、设备和完整环境，成功后才允许请求LLM。checkpoint环境明确不一致会报错；缺少环境记录会警告并使用显式配置，不会静默改变风向。正式模型仅存在服务器时，本地测试不冒充服务器验收。
+
+服务器可先进行不收费的权重与接口检查：对输入的前4个节点，核对直接Stage2贪心与常驻工作进程的路线、时间完全一致。这不是完整风场成绩或性能证明：
+
+```bash
+python -u "stage1+llm/run.py" check-model --stage2-checkpoint "stage2/outputs/finetune-edge-v2/control/best_greedy.pt" --stage2-device cuda
+```
+
+覆盖率（进程外部工具调用不自动计入父进程覆盖率）：
+
+```bash
+python -m coverage run --branch --source="stage1+llm/stage1_llm" -m unittest discover -s "stage1+llm/tests" -p "test_*.py"
+python -m coverage report -m
+```
+
+### 六轮后台试跑（会调用收费API）
+
+```bash
+mkdir -p "stage1+llm/outputs/console" && nohup python -u "stage1+llm/run.py" optimize --search-config "stage1+llm/config/search-v5.json" --stage2-checkpoint "stage2/outputs/finetune-edge-v2/control/best_greedy.pt" --stage2-device cuda --run-id trial-joint-v5 --evaluation-budget 6 --no-improvement-limit 6 --thinking disabled --max-tokens 8192 --api-retries 0 --stream --show-code > "stage1+llm/outputs/console/trial-joint-v5_$(date +%Y%m%d_%H%M%S).log" 2>&1 < /dev/null &
+```
+
+```bash
+tail -f "stage1+llm/outputs/trial-joint-v5/search.log"
+python -u "stage1+llm/run.py" list-candidates --run-id trial-joint-v5
+```
+
+控制台展示公开LLM流式回答、完整代码、10秒心跳、预检、逐区域网络时间/能耗/余量、逐实例总/平均/最大时间及父子代比较。缓存命中使用汇总计数，原始单次推理耗时不当作重复推理耗时累加。
+
+结果包括 `search_state.json`、`summary.json`、`evaluations/*.json`、`events.jsonl`、`trajectory.csv`、`ranking.json`、`ranking.csv` 和 `best.json`。不再输出新版Pareto表。每个可行候选的逐实例完整分区与路线保存在逐轮JSON；选定后的评价另输出冻结清单、路线图和模型指标。
+
+### 正式40轮及恢复
+
+试跑没有持续接口错误且正式模型评价稳定后，再启用新run ID：
+
+```bash
+mkdir -p "stage1+llm/outputs/console" && nohup python -u "stage1+llm/run.py" optimize --search-config "stage1+llm/config/search-v5.json" --stage2-checkpoint "stage2/outputs/finetune-edge-v2/control/best_greedy.pt" --stage2-device cuda --run-id search-joint-v5 --thinking disabled --max-tokens 8192 --api-retries 0 --stream --show-code > "stage1+llm/outputs/console/search-joint-v5_$(date +%Y%m%d_%H%M%S).log" 2>&1 < /dev/null &
+```
+
+```bash
+mkdir -p "stage1+llm/outputs/console" && nohup python -u "stage1+llm/run.py" resume --resume-run-id search-joint-v5 --stage2-checkpoint "stage2/outputs/finetune-edge-v2/control/best_greedy.pt" --stage2-device cuda > "stage1+llm/outputs/console/resume-joint-v5_$(date +%Y%m%d_%H%M%S).log" 2>&1 < /dev/null &
+```
+
+正常恢复不重复已完成实例，也不重新付费生成已有源码。未知结果的中断API请求消耗该轮、不自动重放。恢复核对数据、实现、提示词、checkpoint哈希、设备和完整环境；改变口径需新建实验。同一run ID禁止并发写入。
+
+每个搜索使用排他锁 `outputs/.运行编号.lock`。正常退出自动释放；若进程被强制终止留下锁，确认该编号没有运行进程后才能手动删除锁再恢复。程序不会自动清理无法确认归属的旧锁。候选超时后会先终止候选并回收尚在途的网络响应；监督器可能继续等待至该请求原有的300秒服务故障时限，因此整次监督器墙钟耗时不等于严格的候选执行时限。只有工作进程自身超过服务时限或异常才停止整个搜索。
+
+### 导出、最后评价87与分支定界
+
+```bash
+python -u "stage1+llm/run.py" export-best --run-id search-joint-v5
+```
+
+默认导出当前排名第一者；也可显式 `--candidate-id C0007` 导出已完整评价的可行候选。把下面示例编号换成导出命令实际返回的目录编号，不依据87成绩反复选算法：
+
+```bash
+python -u "stage1+llm/run.py" evaluate --search-config "stage1+llm/config/search-v5.json" --candidate "stage1+llm/outputs/search-joint-v5/selected/C0007/algorithm.py" --input turbine87.tsv --stage2-checkpoint "stage2/outputs/finetune-edge-v2/control/best_greedy.pt" --stage2-device cuda --run-id test87-joint-v5
+```
+
+输出 `summary.json`、`regions.json`、`model_metrics.json`、`evaluation.json` 和逐区域网络路线图。所有风机、机巢、坐标及风况冻结在清单里。新导出包记录可信工具快照、模型哈希和依赖，运行需要匹配的Stage2仓库及单独提供的权重，不再宣称无需模型即可独立执行。
+
+新部署改变了分区，必须针对新的 `regions.json` 重新求分支定界参考，不能沿用旧四区域最优值。最优性gap只在相同区域与环境下比较；分支定界不参与LLM搜索反馈。

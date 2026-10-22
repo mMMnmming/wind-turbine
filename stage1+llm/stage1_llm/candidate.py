@@ -126,7 +126,10 @@ def validate_candidate_source(source: str) -> None:
         if isinstance(node, ast.Name) and node.id.startswith("__"):
             raise ValueError("Dunder names are not allowed in candidate source.")
         if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
-            raise ValueError("Private and dunder attribute access is not allowed.")
+            excerpt = source.splitlines()[node.lineno - 1].strip()[:180]
+            raise ValueError(
+                f"Private and dunder attribute access is not allowed: {node.attr} at line {node.lineno}: {excerpt}"
+            )
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)

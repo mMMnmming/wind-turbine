@@ -1,2 +1,4 @@
 -r requirements.txt
 coverage>=7
+# V5 integration tests also require the operator's existing compatible PyTorch.
+# Install/select CUDA PyTorch separately; do not replace it through this file.

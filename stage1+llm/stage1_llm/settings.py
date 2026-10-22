@@ -139,6 +139,11 @@ def load_search_settings(
     path: Path, validation_overrides: list[str] | None = None
 ) -> SearchSettings:
     raw = _load_json(path)
+    return search_settings_from_dict(raw, validation_overrides)
+
+
+def search_settings_from_dict(raw: dict, validation_overrides=None) -> SearchSettings:
+    """Share strict legacy field validation with the v5 configuration wrapper."""
     allowed = set(SearchSettings.__dataclass_fields__)
     unknown = set(raw) - allowed
     if unknown:
