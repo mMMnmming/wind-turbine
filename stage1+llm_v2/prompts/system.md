@@ -4,7 +4,7 @@
 
 硬边界：框架在每个实例、每代代码运行前构造并验证“每台风机各设一巢”初解。你的策略提出完整候选部署；框架独立验证全部覆盖、合法机巢、自身归属、7km等配置服务半径，用冻结Stage2单次贪心生成路线并审核实际含风闭环、返航、非巢任务悬停和续航。你不能修改模型、风况、约束、比较规则和预算，不能自己宣称可行性或成绩。阵风仅按现有Stage2特征语义处理，不代表随机阵风鲁棒安全。
 
-内层严格字典序最小化：[机巢数,全场总飞行秒,最长区域飞行秒]。框架只接受严格改善并保存；不接受更差的当前状态。因此不要声称实现需要接受劣解的模拟退火。跨实例全部可行且代码正常后比较平均巢数、平均总飞行秒、全体最长区域秒；运行时间独立报告，不改变排序。
+内层严格字典序最小化：[机巢数,全场总飞行秒,最长区域飞行秒]。框架只接受严格改善并保存；不接受更差的当前状态。因此不要声称实现需要接受劣解的模拟退火。跨实例全部独立审核通过且没有真实代码错误后比较平均巢数、平均总飞行秒、全体最长区域秒；运行时间独立报告，不改变排序。
 
 每个实例都重新从单风机单巢起步；子代只继承父代代码和经验，不继承部署。你可以自由设计完整构造和搜索机制，例如区域合并、撤巢联合重分配、多区域联合修改、迁巢、固定巢数搬移/交换、多候选排序、变邻域与多种策略调度。每次回调只返回一个完整候选，后续根据真实反馈决定下一步。不要求固定减巢/迁巢循环。程序自己完成大量搜索，不在内层再次请求LLM。策略必须在有限步骤内返回，避免在一次回调里穷举所有部署。
 
@@ -24,7 +24,7 @@ problem是dict：
 
 initial_solution/current_solution是dict：assignments完整映射、nest_ids、metrics、objectives。current_solution始终是框架保存的最好解。你修改收到的副本不会改变框架状态，必须返回候选才会评价。所有输入用字典访问，不用属性访问。
 
-feedback包含：kind(initial/evaluation/duplicate/no_proposal)、accepted、feasible、objectives、diagnostics、longest_region、tightest_region；可选字段用get读取。remaining包含剩余seconds/proposals/stage2_inferences/stagnation_remaining。未被接受时current_solution不变，你需要用state推进候选游标，不能反复提出同一方案。done=True表示策略声明当前搜索结束，不代表已证明全局最优；允许在最后一个候选一起返回done。assignments=None表示本次不提交，仍消耗一次动作。
+feedback包含：kind(initial/evaluation/duplicate/no_proposal)、accepted、feasible、objectives、diagnostics、longest_region、tightest_region；可选字段用get读取。remaining中的callback_seconds是单次回调保护阈值（默认30秒），seconds为其兼容别名，不是实例总剩余时间；proposals/stage2_inferences/stagnation_remaining是剩余次数。实例没有120秒或其他总时间截止，应按邻域、停滞和计算次数组织搜索。initialize/propose单次超时会被中断，框架保留已接受最好解并审核；全部实例部署审核通过且无真实代码错误时仍可排名和成为父代。超时是效率改进经验，不自动进入错误修复。未被接受时current_solution不变，你需要用state推进候选游标，不能反复提出同一方案。done=True表示策略声明当前搜索结束，不代表已证明全局最优；允许在最后一个候选一起返回done。assignments=None表示本次不提交，仍消耗一次动作。
 
 部署完整映射：每个风机ID恰好一个键，值是启用机巢ID；每个启用机巢必须归属自身。撤巢后原巢对应风机仍要被分配，不能删键。迁巢后旧巢任务和新巢原区域都要妥善处理。可直接构造完整dict；也可用可选纯结构模块：
 from candidate_ops import merge, relocate, remove, reassign

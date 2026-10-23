@@ -25,6 +25,9 @@ def parser():
         sub.add_argument("--stage2-device", choices=("cpu", "cuda"))
         sub.add_argument("--outputs", type=Path, default=LOCAL / "outputs")
         sub.add_argument("--run-id", type=validate_run_id)
+        if command in ("optimize", "resume", "evaluate"):
+            sub.add_argument("--callback-timeout-seconds", type=float,
+                             help="Single strategy call watchdog; best audited solution remains eligible (default 30)")
         if command in ("optimize", "resume"):
             sub.add_argument("--deepseek-config", type=Path, default=LOCAL / "config/deepseek.local.json")
             sub.add_argument("--evaluation-budget", type=int, help="Target number of fully qualified algorithm cases")
@@ -84,6 +87,8 @@ def main(argv=None):
             overrides["evaluation_budget"] = args.evaluation_budget
         if getattr(args, "max_attempts_per_round", None) is not None:
             overrides["max_attempts_per_round"] = args.max_attempts_per_round
+        if getattr(args, "callback_timeout_seconds", None) is not None:
+            overrides["callback_timeout_seconds"] = args.callback_timeout_seconds
         settings = replace(settings, **overrides)
         if args.command == "prepare-data":
             from .data import prepare_data
@@ -151,15 +156,21 @@ def main(argv=None):
                                       planner, records, "external", 1, 1)
                 from .evolution import compact_instance
                 records.json("instance_metrics.json", [compact_instance(result)])
-                records.json("summary.json", {"status": "completed" if result["code_success"] else "candidate_error",
-                    "origin": "external_code", "oracle": planner.metadata, "objectives": result["objectives"]})
-                return 0 if result["code_success"] else 1
+                usable = result["solution_usable"] and not result["fatal_error"]
+                records.json("summary.json", {"status": result["execution_status"],
+                    "solution_usable": result["solution_usable"], "fatal_error": result["fatal_error"],
+                    "interruptions": result["interruptions"], "origin": "external_code",
+                    "oracle": planner.metadata, "objectives": result["objectives"]})
+                return 0 if usable else 1
             from .data import prepare_data
             from .evolution import Evolution
             bundle = prepare_data(settings)
             records.progress(f"[运行] 目标{settings.evaluation_budget}个有效案例｜每轮最多{settings.max_attempts_per_round}次尝试"
                              f"｜{len(bundle['datasets'])}实例/案例"
-                             f"｜每实例搜索上限{settings.search_seconds:g}s｜每代从单风机单巢起步")
+                             f"｜按搜索进展停止，无总时间截止｜单次调用保护{settings.callback_timeout_seconds:g}s"
+                             "｜每代从单风机单巢起步")
+            if settings.search_seconds is not None:
+                records.progress("[兼容配置] search_seconds已弃用，不作为搜索停止条件")
             status = Evolution(settings, llm, bundle, planner, records).run(resume=args.command == "resume")
             return 0 if status == "target_completed" else 2
     except KeyboardInterrupt:

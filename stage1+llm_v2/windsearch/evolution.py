@@ -63,9 +63,22 @@ def exclusive_run(root):
 
 
 def compact_instance(row):
-    return {k: row[k] for k in ("name", "split", "code_success", "feasible", "stop_reason",
+    result = {k: row[k] for k in ("name", "split", "code_success", "feasible", "stop_reason",
             "only_initial_solution", "initial_objectives", "objectives", "metrics", "search",
             "failure_counts", "timing", "oracle_counters", "final_audit_counters")}
+    result.update(execution_status=row.get("execution_status", "completed" if row["code_success"] else "failed"),
+                  solution_usable=row.get("solution_usable", row["feasible"]),
+                  fatal_error=row.get("fatal_error", row.get("error")),
+                  interruptions=row.get("interruptions", []))
+    return result
+
+
+def instance_counts(instances):
+    return {"audited_instances": sum(r.get("solution_usable", r.get("feasible", False)) for r in instances),
+            "normal_completion_instances": sum(r.get("execution_status", "completed" if r["code_success"] else "failed") == "completed" for r in instances),
+            "interrupted_instances": sum(r.get("execution_status") == "interrupted_timeout" for r in instances),
+            "fatal_instances": sum(bool(r.get("fatal_error")) for r in instances),
+            "initial_only_instances": sum(r["only_initial_solution"] for r in instances)}
 
 
 def aggregate(rows):
@@ -84,7 +97,7 @@ class Evolution:
         self.elapsed_before = 0.0
         self.client = None
         self.system = (LOCAL / "prompts/system.md").read_text(encoding="utf-8")
-        self.identity = {"version": 2, "evolution_schema": "qualified-cases-v1",
+        self.identity = {"version": 2, "evolution_schema": "quality-progress-v1",
                          "interface": "initialize-propose-v2",
                          "settings": settings.snapshot(), "dataset": bundle["fingerprint"],
                          "oracle": planner.metadata, "provider": {
@@ -131,7 +144,8 @@ class Evolution:
         context = {"direction_id": op, "instruction": OPERATORS[op],
                    "initialization": "every candidate-instance starts with one nest per turbine",
                    "work_limits": {k: getattr(self.settings, k) for k in
-                                   ("search_seconds", "max_proposals", "max_stage2_inferences", "stagnation_limit")},
+                                   ("callback_timeout_seconds", "max_proposals", "max_stage2_inferences", "stagnation_limit")},
+                   "stop_policy": "search_progress; no instance wall-clock deadline; callback timeout preserves best solution",
                    "parents": [], "recent": [], "best_objectives": (
                        self.archive()[0]["objectives"] if self.archive() else None)}
         if repair_target:
@@ -149,6 +163,7 @@ class Evolution:
                 "algorithm_code": (self.records.root / parent["source_path"]).read_text(encoding="utf-8")
                     if parent.get("source_path") else None,
                 "idea": parent.get("algorithm_idea"), "objectives": parent.get("objectives"),
+                "instance_counts": instance_counts(parent.get("instances", [])),
                 "instances": [self.feedback_instance(i) for i in parent.get("instances", [])],
                 "error": self.error_brief(parent.get("error")),
                 "timing": parent.get("timing")})
@@ -167,13 +182,16 @@ class Evolution:
         return {"name": row["name"], "objectives": row["objectives"],
                 "minimum_endurance_margin_seconds": row["metrics"]["minimum_endurance_margin_seconds"],
                 "stop_reason": row["stop_reason"], "only_initial_solution": row["only_initial_solution"],
+                "execution_status": row.get("execution_status", "completed"),
+                "solution_usable": row.get("solution_usable", row["feasible"]),
+                "interruptions": row.get("interruptions", []),
                 "search_seconds": row["timing"]["search_seconds"],
                 "strategy_seconds": row["timing"]["strategy_seconds"],
                 "evaluation_seconds": row["timing"]["evaluation_seconds"],
                 "inferences": row["oracle_counters"].get("inferences", 0),
                 "search": {k: row["search"].get(k) for k in (
                     "distinct_candidates", "feasible_candidates", "improvements", "fixed_k_improvements",
-                    "duplicates", "first_improvement_seconds", "best_at_seconds")},
+                    "duplicates", "first_improvement_seconds", "last_improvement_seconds", "best_at_seconds")},
                 "failure_counts": row["failure_counts"]}
 
     @staticmethod
@@ -233,7 +251,12 @@ class Evolution:
 
     def evaluate(self, row):
         source = (self.records.root / row["source_path"]).read_text(encoding="utf-8")
-        validate_candidate_source(source)
+        try:
+            validate_candidate_source(source)
+        except (SyntaxError, ValueError) as exc:
+            row.update(eligible=False, objectives=None, status="candidate_error",
+                       error={"error": str(exc), "error_type": type(exc).__name__})
+            return
         instances = row.setdefault("instances", [])
         if row.get("error"):
             row.update(eligible=False, objectives=None, status="candidate_error")
@@ -245,16 +268,19 @@ class Evolution:
                                   self.settings, self.planner, self.records, row["attempt_id"],
                                   index, len(self.bundle["datasets"]))
             instances.append(compact_instance(result))
-            if result["error"]:
-                row["error"] = {**result["error"], "instance": dataset["name"]}
+            fatal = result.get("fatal_error", result.get("error"))
+            if fatal:
+                row["error"] = {**fatal, "instance": dataset["name"]}
                 self.save()
                 break
             self.save()
         complete = len(instances) == len(self.bundle["datasets"])
         row["eligible"] = complete and not row.get("error") and all(
-            r["code_success"] and r["feasible"] for r in instances)
+            r["solution_usable"] and not r["fatal_error"] for r in instances)
         row["objectives"] = aggregate(instances) if row["eligible"] else None
-        row["status"] = "completed" if row["eligible"] else "candidate_error"
+        row["status"] = ("completed_with_interruptions" if any(r["interruptions"] for r in instances)
+                         else "completed") if row["eligible"] else "candidate_error"
+        row.update(instance_counts(instances))
         if instances:
             row["timing"] = {k: sum(r["timing"][k] for r in instances)
                              for k in instances[0]["timing"]}
@@ -279,7 +305,8 @@ class Evolution:
         if row.get("eligible"):
             k, total, maximum = row["objectives"]
             self.records.progress(f"[案例完成 {row['candidate_id']}] 来源{row['attempt_id']}"
-                                  f"｜{len(row['instances'])}/{len(self.bundle['datasets'])}实例正常可行"
+                                  f"｜{len(row['instances'])}/{len(self.bundle['datasets'])}部署审核通过"
+                                  f"｜中断{instance_counts(row['instances'])['interrupted_instances']}个实例｜参与质量排名"
                                   f"｜平均{k:.4f}巢 / {total:.1f}s｜最长区域{maximum:.1f}s"
                                   f"｜超过父代:{'是' if row['improved_parent'] else '否/无可行父代'}"
                                   f"｜刷新最好:{'是' if row['improved_global'] else '否'}")
@@ -322,7 +349,8 @@ class Evolution:
     def reports(self, status, error=None):
         archive = self.archive()
         best = archive[0] if archive else None
-        summary = {"version": 2, "evolution_schema": "qualified-cases-v1", "status": status,
+        summary = {"version": 2, "evolution_schema": "quality-progress-v1", "status": status,
+                   "stop_policy": "search_progress", "callback_timeout_seconds": self.settings.callback_timeout_seconds,
                    "evaluated_rounds": len(self.cases()), "completed_cases": len(self.cases()),
                    "attempted_generations": len(self.history) + bool(self.pending),
                    "pending_attempt": self.pending["row"]["attempt_id"] if self.pending else None,
@@ -342,6 +370,7 @@ class Evolution:
                    "total_search_inferences": sum(i["oracle_counters"].get("inferences", 0)
                         for r in self.history for i in r.get("instances", [])),
                    "api_usage": self.token_usage()}
+        summary.update(instance_counts([i for r in self.history for i in r.get("instances", [])]))
         self.records.json("summary.json", summary)
         self.records.json("instance_metrics.json", [{"candidate_id": r.get("candidate_id"),
             "attempt_id": r["attempt_id"], "round_index": r["round_index"],
@@ -349,7 +378,8 @@ class Evolution:
         columns = ["candidate_id", "attempt_id", "round_index", "attempt_number", "parent_ids",
                    "repair_target", "selection_reason", "operator", "status", "objectives", "llm_seconds",
                    "search_seconds", "strategy_seconds", "evaluation_seconds", "total_seconds",
-                   "successful_instances", "initial_only_instances", "stage2_inferences",
+                   "successful_instances", "audited_instances", "normal_completion_instances",
+                   "interrupted_instances", "fatal_instances", "initial_only_instances", "stage2_inferences",
                    "improved_parent", "improved_global", "prompt_tokens", "completion_tokens", "total_tokens", "error"]
         buffer = io.StringIO(newline="")
         writer = csv.DictWriter(buffer, fieldnames=columns)
@@ -359,6 +389,7 @@ class Evolution:
             out.update(row.get("timing", {}))
             out = {k: out.get(k) for k in columns}
             instances = row.get("instances", [])
+            out.update(instance_counts(instances))
             out["successful_instances"] = sum(r["code_success"] for r in instances)
             out["initial_only_instances"] = sum(r["only_initial_solution"] for r in instances)
             out["stage2_inferences"] = sum(r["oracle_counters"].get("inferences", 0) for r in instances)
@@ -451,6 +482,8 @@ class Evolution:
                            "parent_ids": [r["candidate_id"] for r in parents], "instances": []}
                     try:
                         self.generate(row, self.feedback(op, parents, repair_target))
+                    except (OSError, InfrastructureError) as exc:
+                        raise InfrastructureError(f"Generation infrastructure failed: {exc}") from exc
                     except Exception as exc:
                         row.update(status="generation_error", eligible=False,
                                    error={"error": str(exc), "error_type": type(exc).__name__,
@@ -462,12 +495,10 @@ class Evolution:
                 except InfrastructureError:
                     raise
                 except Exception as exc:
-                    row.update(status="candidate_error", eligible=False,
-                               error={"error": str(exc), "error_type": type(exc).__name__,
-                                      "traceback": traceback.format_exc()})
+                    raise InfrastructureError(f"Evaluation framework failed: {type(exc).__name__}: {exc}") from exc
                 self.finish(row)
             self.reports(status)
-            best = self.archive()[0]["candidate_id"] if self.archive() else "无正常完成算法"
+            best = self.archive()[0]["candidate_id"] if self.archive() else "无合格算法"
             self.records.progress(f"[运行结束] 完成{len(self.cases())}/{self.settings.evaluation_budget}个有效案例"
                                   f"｜生成尝试{len(self.history)}次｜最好:{best}｜结果:{self.records.root}")
             return status

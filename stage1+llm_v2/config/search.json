@@ -22,7 +22,7 @@
   "evaluation_budget": 6,
   "max_attempts_per_round": 3,
   "seed": 1234,
-  "search_seconds": 120.0,
+  "callback_timeout_seconds": 30.0,
   "max_proposals": 20000,
   "max_stage2_inferences": 5000,
   "stagnation_limit": 1000,

@@ -7,9 +7,8 @@ from collections import Counter
 
 from .artifacts import signature
 from .evaluator import Evaluator, WorkBudgetExceeded, compact_feedback, problem_input, solution
-from .execution import StrategyError, StrategyWorker
+from .execution import StrategyCallbackTimeout, StrategyError, StrategyWorker
 from .planner import InfrastructureError
-from .sandbox import CandidateDeadlineExceeded
 
 
 def run_instance(source, filename, dataset, settings, planner, records, candidate_id, index, count):
@@ -29,12 +28,13 @@ def run_instance(source, filename, dataset, settings, planner, records, candidat
     stats = {"proposals": 0, "distinct_candidates": 0, "feasible_candidates": 0,
              "improvements": 0, "fixed_k_improvements": 0, "nest_reductions": 0,
              "duplicates": 0, "strategy_seconds": 0.0,
-             "first_improvement_seconds": None, "best_at_seconds": 0.0}
+             "first_improvement_seconds": None, "last_improvement_seconds": None, "best_at_seconds": 0.0}
     failures = Counter()
     best, best_checked = None, None
     search_started = None
     self_reported_phase = ""
-    call_started = None
+    interruptions = []
+    execution_status = "completed"
 
     def progress():
         elapsed = time.perf_counter() - (search_started or total_started)
@@ -54,7 +54,7 @@ def run_instance(source, filename, dataset, settings, planner, records, candidat
     heartbeat.start()
     worker = None
     error = None
-    stop_reason = "budget_exhausted"
+    stop_reason = "proposal_budget_exhausted"
     search_seconds, evaluation_seconds = 0.0, 0.0
     search_oracle, audit_oracle = {}, {}
     curve = []
@@ -66,38 +66,38 @@ def run_instance(source, filename, dataset, settings, planner, records, candidat
         initial = best = solution(assignments, initial_checked)
         problem = problem_input(points, settings.deployment, planner.metadata)
         records.json("diagnostics/runtime/" + scope + "-problem.json", problem)
-        records.progress(f"[实例 {index}/{count} {candidate_id}/{name}] 初始{len(points)}巢｜开始部署搜索")
+        records.progress(f"[实例 {index}/{count} {candidate_id}/{name}] 初始{len(points)}巢"
+                         f"｜按搜索进展停止｜单次调用保护{settings.callback_timeout_seconds:g}s")
         records.event("instance_start", candidate=candidate_id, instance=name,
                       initial=initial, cache_policy="cold_candidate_instance")
         search_started = time.perf_counter()
-        deadline = search_started + settings.search_seconds
         evaluation_start = evaluator.seconds
         worker = StrategyWorker(records, scope)
         stage["name"] = "候选代码初始化中"
-        call_started = time.perf_counter()
         ready = worker.exchange({"source": source, "filename": filename, "problem": problem,
                                  "initial": initial, "seed": settings.seed},
-                                deadline, settings.heartbeat_seconds, lambda: None)
+                                settings.callback_timeout_seconds, settings.heartbeat_seconds,
+                                lambda: None, operation="initialize")
         stats["strategy_seconds"] += ready["strategy_seconds"]
         feedback = {"kind": "initial", "accepted": True, **compact_feedback(initial_checked)}
         seen = {signature(assignments): compact_feedback(initial_checked)}
         stagnant = 0
         for attempt in range(settings.max_proposals):
-            if time.perf_counter() >= deadline:
-                break
             if planner.stats().get("inferences", 0) >= settings.max_stage2_inferences:
                 stop_reason = "inference_budget_exhausted"
                 break
             stage["name"] = "候选代码执行中"
-            call_started = time.perf_counter()
             feedback["remaining"] = {
-                "seconds": max(0.0, deadline - time.perf_counter()),
+                "seconds": settings.callback_timeout_seconds,
+                "callback_seconds": settings.callback_timeout_seconds,
+                "search_seconds": None,
                 "proposals": settings.max_proposals - attempt,
                 "stage2_inferences": settings.max_stage2_inferences - planner.stats().get("inferences", 0),
                 "stagnation_remaining": settings.stagnation_limit - stagnant,
             }
             row = worker.exchange({"current_solution": best, "feedback": feedback},
-                                  deadline, settings.heartbeat_seconds, lambda: None)
+                                  settings.callback_timeout_seconds, settings.heartbeat_seconds,
+                                  lambda: None, operation="propose")
             stats["strategy_seconds"] += row["strategy_seconds"]
             answer = row["answer"]
             self_reported_phase = answer["phase"]
@@ -119,7 +119,7 @@ def run_instance(source, filename, dataset, settings, planner, records, candidat
                 else:
                     stats["distinct_candidates"] += 1
                     stage["name"] = "框架约束检查 / Stage2评价"
-                    checked = evaluator.check(candidate, deadline=deadline,
+                    checked = evaluator.check(candidate,
                                               inference_limit=settings.max_stage2_inferences)
                     compact = compact_feedback(checked)
                     seen[key] = compact
@@ -143,6 +143,7 @@ def run_instance(source, filename, dataset, settings, planner, records, candidat
                         stats["fixed_k_improvements" if fixed_k else "nest_reductions"] += 1
                         elapsed = time.perf_counter() - search_started
                         stats["best_at_seconds"] = elapsed
+                        stats["last_improvement_seconds"] = elapsed
                         if stats["first_improvement_seconds"] is None:
                             stats["first_improvement_seconds"] = elapsed
                         improvement = {"elapsed_seconds": elapsed, "attempt": attempt + 1,
@@ -168,39 +169,46 @@ def run_instance(source, filename, dataset, settings, planner, records, candidat
                 break
         else:
             stop_reason = "proposal_budget_exhausted"
-    except (CandidateDeadlineExceeded, TimeoutError):
-        stop_reason = "time_budget_exhausted"
-        if stage["name"] in ("候选代码初始化中", "候选代码执行中"):
-            if call_started is not None:
-                stats["strategy_seconds"] += time.perf_counter() - call_started
-                stats["timed_out_callback_uses_wall_time"] = True
-            error = {"error_type": "StrategyTimeout",
-                     "error": "Strategy callback did not return before the search deadline"}
-            stop_reason = "candidate_timeout"
+    except StrategyCallbackTimeout as exc:
+        execution_status = "interrupted_timeout"
+        stop_reason = "callback_watchdog"
+        stats["strategy_seconds"] += exc.detail["elapsed_seconds"]
+        stats["timed_out_callback_uses_wall_time"] = True
+        interruptions.append({**exc.detail, "phase": stage["name"],
+                              "best_objectives": best["objectives"] if best else None})
+        records.event("callback_interrupted", candidate=candidate_id, instance=name,
+                      **interruptions[-1])
+        records.progress(f"[调用中断 {candidate_id}/{name}] {exc.detail['operation']}超过"
+                         f"{settings.callback_timeout_seconds:g}s｜保留已保存最好解")
     except WorkBudgetExceeded:
         stop_reason = "inference_budget_exhausted"
     except StrategyError as exc:
         error = exc.detail
+        execution_status = "failed"
         stats["strategy_seconds"] += error.get("strategy_seconds", 0.0)
         stop_reason = "candidate_error"
     except InfrastructureError:
         raise
     except Exception as exc:
-        import traceback
-        error = {"error": str(exc), "error_type": type(exc).__name__, "traceback": traceback.format_exc()}
-        stop_reason = "candidate_error"
+        raise InfrastructureError(f"Search framework failed: {type(exc).__name__}: {exc}") from exc
     finally:
         if search_started is not None:
             search_seconds = time.perf_counter() - search_started
             evaluation_seconds = evaluator.seconds - evaluation_start
-        if worker:
-            worker.close()
-        stop_heartbeat.set()
-        heartbeat.join(timeout=2)
+        cleanup_start = time.perf_counter()
+        try:
+            if worker:
+                worker.close()
+        finally:
+            stop_heartbeat.set()
+            heartbeat.join(timeout=2)
+        cleanup_seconds = time.perf_counter() - cleanup_start
 
     if best is None:
         raise InfrastructureError("Initial deployment could not be established")
+    drain_start = time.perf_counter()
     planner.settle()
+    drain_seconds = time.perf_counter() - drain_start
     search_oracle = planner.stats()
     # A fresh, independent final audit is outside the strategy's search budget.
     audit_start = time.perf_counter()
@@ -222,7 +230,9 @@ def run_instance(source, filename, dataset, settings, planner, records, candidat
         records.json("diagnostics/errors/" + scope + ".json", error)
     result = {
         "name": name, "split": dataset["split"], "candidate_id": candidate_id,
-        "code_success": error is None, "feasible": True, "error": error,
+        "code_success": execution_status == "completed", "execution_status": execution_status,
+        "solution_usable": True, "feasible": True, "error": error, "fatal_error": error,
+        "interruptions": interruptions,
         "stop_reason": stop_reason, "only_initial_solution": stats["improvements"] == 0,
         "initial_objectives": initial["objectives"], "objectives": best["objectives"],
         "metrics": final_checked["metrics"], "search": dict(stats),
@@ -231,6 +241,7 @@ def run_instance(source, filename, dataset, settings, planner, records, candidat
                    "evaluation_seconds": evaluation_seconds,
                    "supervisor_seconds": max(0.0, search_seconds - evaluation_seconds - stats["strategy_seconds"]),
                    "final_audit_seconds": time.perf_counter() - audit_start,
+                   "cleanup_seconds": cleanup_seconds, "drain_seconds": drain_seconds,
                    "total_seconds": time.perf_counter() - total_started},
         "oracle_counters": search_oracle, "final_audit_counters": audit_oracle,
         "solution": best, "final_audit": final_checked,
@@ -239,9 +250,10 @@ def run_instance(source, filename, dataset, settings, planner, records, candidat
     labels = {"time_budget_exhausted": "时间预算耗尽", "proposal_budget_exhausted": "候选预算耗尽",
               "inference_budget_exhausted": "推理预算耗尽", "stagnation_limit": "连续无改善",
               "candidate_error": "代码错误", "strategy_declared_neighborhood_exhausted": "策略声明邻域结束"}
-    labels["candidate_timeout"] = "候选代码执行超时"
+    labels["callback_watchdog"] = "单次调用超时，保留最好解"
     records.progress(f"[实例结束 {candidate_id}/{name}] {best['metrics']['nest_count']}巢 / "
-                     f"{best['metrics']['total_flight_seconds']:.1f}s｜停止:{labels[stop_reason]}"
+                     f"{best['metrics']['total_flight_seconds']:.1f}s｜停止:{labels.get(stop_reason, stop_reason)}"
+                     f"｜部署审核通过｜执行状态:{execution_status}"
                      f"｜搜索{search_seconds:.1f}s（策略{stats['strategy_seconds']:.1f}s/评价{evaluation_seconds:.1f}s）"
                      + ("｜仅保底" if stats["improvements"] == 0 else ""))
     if error:

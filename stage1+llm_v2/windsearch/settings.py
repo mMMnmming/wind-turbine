@@ -35,7 +35,8 @@ class SearchSettings:
     evaluation_budget: int = 6
     max_attempts_per_round: int = 3
     seed: int = 1234
-    search_seconds: float = 120.0
+    search_seconds: float | None = None  # Legacy input only; never a stopping limit.
+    callback_timeout_seconds: float = 30.0
     max_proposals: int = 20000
     max_stage2_inferences: int = 5000
     stagnation_limit: int = 1000
@@ -54,10 +55,13 @@ class SearchSettings:
                     "data_seed", "validation_seed"):
             if type(getattr(self, key)) is not int or getattr(self, key) < 0:
                 raise ValueError(key + " must be a nonnegative integer")
-        for key in ("search_seconds", "heartbeat_seconds", "stage2_timeout_seconds"):
+        for key in ("callback_timeout_seconds", "heartbeat_seconds", "stage2_timeout_seconds"):
             value = getattr(self, key)
             if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
                 raise ValueError(key + " must be finite and positive")
+        if self.search_seconds is not None and (isinstance(self.search_seconds, bool) or
+                not math.isfinite(self.search_seconds) or self.search_seconds <= 0):
+            raise ValueError("Legacy search_seconds must be null or finite and positive")
         if self.stage2_device not in ("cpu", "cuda"):
             raise ValueError("stage2_device must be cpu or cuda")
         if not math.isfinite(self.gust_speed_mps) or self.gust_speed_mps < 0:

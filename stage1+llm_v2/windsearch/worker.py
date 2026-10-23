@@ -36,6 +36,8 @@ def main():
     try:
         data = json.loads(sys.stdin.readline())
         filename = data["filename"]
+        start = time.perf_counter()
+        send({"ok": True, "kind": "callback_started", "operation": "initialize", "started_at": start})
         validate_candidate_source(data["source"])
         facade = ModuleType("candidate_ops")
         for name in ("merge", "relocate", "remove", "reassign"):
@@ -51,7 +53,6 @@ def main():
         allowed = {name: getattr(builtins, name) for name in BUILTINS}
         allowed["__import__"] = safe_import
         scope = {"__builtins__": allowed}
-        start = time.perf_counter()
         random.seed(data["seed"])
         exec(compile(data["source"], filename, "exec"), scope, scope)
         state = scope["initialize"](copy.deepcopy(data["problem"]),
@@ -63,6 +64,7 @@ def main():
             if request.get("command") == "close":
                 break
             start = time.perf_counter()
+            send({"ok": True, "kind": "callback_started", "operation": "propose", "started_at": start})
             answer = scope["propose"](copy.deepcopy(data["problem"]),
                                        request["current_solution"], state, request["feedback"])
             if not isinstance(answer, dict) or set(answer) != {"assignments", "state", "phase", "done"}:
@@ -78,7 +80,7 @@ def main():
         frames = traceback.extract_tb(error.__traceback__)
         candidate_frames = [{"line": f.lineno, "function": f.name}
                             for f in frames if f.filename == filename]
-        send({"ok": False, "error": str(error), "error_type": type(error).__name__,
+        send({"ok": False, "kind": "strategy_error", "error": str(error), "error_type": type(error).__name__,
               "candidate_frames": candidate_frames, "traceback": traceback.format_exc(),
               "strategy_seconds": time.perf_counter() - start if start is not None else 0.0})
         return 1

@@ -100,6 +100,14 @@ def validate_result(problem, result, source):
     return points, assignments, sorted(nests), regions, audit["metrics"]
 
 
+def execution_marker(result, metadata):
+    if result.get("execution_status") == "interrupted_timeout" and result.get("solution_usable") and not result.get("fatal_error"):
+        return "INTERRUPTED"
+    if not result.get("code_success", False):
+        return "FAILED"
+    return "NOT QUALIFIED" if metadata.get("eligible") is False else None
+
+
 def render_diagnostic(problem_path, result_path, output, candidate, instance, metadata,
                       show_radius, show_routes=True):
     # Import only plotting dependencies; no evaluator, candidate source or Stage2.
@@ -165,10 +173,8 @@ def render_diagnostic(problem_path, result_path, output, candidate, instance, me
                 transform=ax.transAxes, ha="right", va="top", fontsize=9,
                 bbox={"facecolor": "white", "alpha": .85, "edgecolor": "none"})
         candidate_status = metadata["status"]
-        if not result.get("code_success", False):
-            candidate_status = "FAILED: " + candidate_status
-        elif metadata.get("eligible") is False:
-            candidate_status = "NOT QUALIFIED: " + candidate_status
+        if execution_marker(result, metadata):
+            candidate_status = execution_marker(result, metadata) + ": " + candidate_status
         ax.set_title(f"{candidate} / {instance}\n{candidate_status}; stop: {result['stop_reason']}", fontsize=12)
         fig.text(.02, .01,
                  f"Nests: {metrics['nest_count']}  |  Total flight: {metrics['total_flight_seconds']:.2f} s  |  "
@@ -189,6 +195,8 @@ def render_diagnostic(problem_path, result_path, output, candidate, instance, me
         return {"instance": instance, "status": "plotted", "files": [str(p) for p in paths],
                 "metrics": metrics, "candidate_status": candidate_status,
                 "code_success": result.get("code_success"), "stop_reason": result["stop_reason"],
+                "execution_status": result.get("execution_status"),
+                "solution_usable": result.get("solution_usable"),
                 "problem_file": str(problem_path), "result_file": str(result_path),
                 "nest_ids": nests, "assignment_count": len(assignments),
                 "route_ids": {r["nest_id"]: r["route_ids"] for r in regions}}
@@ -270,8 +278,7 @@ def render(problem_path, result_path, output, candidate, instance, metadata,
         radius = float(problem["config"]["communication_radius_km"])
         if not math.isfinite(radius) or radius <= 0:
             raise ValueError(f"{problem_path}: invalid service radius")
-        marker = ("FAILED" if not result.get("code_success", False) else
-                  "NOT QUALIFIED" if metadata.get("eligible") is False else None)
+        marker = execution_marker(result, metadata)
         fig, _ = paper_figure(points, nests, regions, radius, radius_visible, routes_visible, marker)
         try:
             output.mkdir(parents=True, exist_ok=True)
@@ -281,6 +288,8 @@ def render(problem_path, result_path, output, candidate, instance, metadata,
             row = {"instance": instance, "status": "plotted", "files": [str(p) for p in paths],
                    "metrics": metrics, "candidate_status": ((marker+": ") if marker else "")+metadata["status"],
                    "code_success": result.get("code_success"), "stop_reason": result["stop_reason"],
+                   "execution_status": result.get("execution_status"),
+                   "solution_usable": result.get("solution_usable"),
                    "problem_file": str(problem_path), "result_file": str(result_path),
                    "nest_ids": nests, "assignment_count": len(assignments), "font_family": paper_font(),
                    "environment": problem.get("environment"), "service_radius_km": radius,

@@ -37,7 +37,7 @@ def propose(problem, current_solution, state, feedback):
 
 `problem` 含风机坐标、部署配置、固定风况，以及由 Stage2 相同风模型计算的有向航段时间矩阵及 ID 顺序。矩阵可用于构造/排序，不能替代网络实际路线审核。
 
-`feedback` 包括上次是否可行/被接受、目标、主要拒绝原因、最长/最紧区域、剩余时间/动作/推理/停滞预算。策略用 JSON 可序列化 `state` 推进游标，不能把 `Random`、集合或迭代器放进状态。
+`feedback` 包括上次是否可行/被接受、目标、主要拒绝原因、最长/最紧区域、单次回调保护时间及剩余动作/推理/停滞预算。策略用 JSON 可序列化 `state` 推进游标，不能把 `Random`、集合或迭代器放进状态。
 
 可选 `candidate_ops` 的 `merge/relocate/remove/reassign` 是纯结构变换，不选目标、不修复、不搜索。也允许自行组织完整归属。具体契约见 `prompts/system.md`。
 
@@ -86,10 +86,15 @@ outputs/<run-id>/
 
 - `strategy_declared_neighborhood_exhausted`：策略声明当前邻域搜索结束，不是全局最优证明。
 - `stagnation_limit`：连续一定动作没有严格改善，包括重复或空提交。
-- `time_budget_exhausted` / `proposal_budget_exhausted` / `inference_budget_exhausted`：达到对应预算。
-- `candidate_error` / `candidate_timeout`：代码异常/回调未在时间内返回，单独标记失败。
+- `proposal_budget_exhausted` / `inference_budget_exhausted`：达到提交或推理预算。
+- `candidate_error`：真实语法、接口或运行异常，本次尝试失败。
+- `callback_watchdog`：单次初始化或策略回调超时，中断工作进程，保留最好部署并独立审核，继续其他实例。
 
-初始默认每实例搜索120秒、20000次提交、5000次Stage2推理、1000次连续无改善，先达到者停止。初解验证和最终独立审核在搜索预算之外，单独计时。改进是对已接受部署的严格改善，不允许劣解成为当前解。
+默认每实例20000次提交、5000次Stage2推理、1000次连续无改善，或策略主动结束；不设置实例总时间截止。`--callback-timeout-seconds` 默认30，仅保护单次初始化/策略调用。旧 `search_seconds` 配置可读取但不控制停止。初解验证和最终独立审核在搜索预算之外，单独计时。改进是对已接受部署的严格改善，不允许劣解成为当前解。
+
+执行状态与解的状态分开保存：`execution_status` 为 `completed`、`interrupted_timeout` 或 `failed`；`code_success` 仅表示正常完成，`solution_usable` 表示独立审核通过，`fatal_error` 仅记录真实代码错误，`interruptions` 记录超时阶段及阈值。全部17实例有可用部署且无真实代码错误即可排名、完成案例或成为父代；中断不会自动触发修复。初始化超时可能只返回保底部署，以 `only_initial_solution` 明示。Stage2、框架或持久化故障停止运行并保留恢复状态，不当作LLM代码错误。绘图将有效中断结果标记为 `INTERRUPTED`。
+
+本次规则请使用新run ID；旧结果不重写、重排或晋升。旧候选可用已有 `evaluate` 命令重新评价，不需要调用LLM。
 
 外层默认目标是6个完整通过全部17实例的有效案例，**不是6次API请求**。`--evaluation-budget` 表示有效案例目标；`--max-attempts-per-round` 默认为3，包含首次生成。SDK重试固定为0，额外请求均由控制器显式记录。
 
@@ -134,7 +139,7 @@ nohup python -u "stage1+llm_v2/run.py" optimize \
   --run-id "$run_id" \
   --deepseek-config "stage1+llm/config/deepseek.local.json" \
   --stage2-device cuda \
-  --evaluation-budget 6 --max-attempts-per-round 3 \
+  --evaluation-budget 6 --max-attempts-per-round 3 --callback-timeout-seconds 30 \
   --thinking disabled --max-tokens 8192 --stream \
   > "stage1+llm_v2/outputs/console/${run_id}.log" 2>&1 < /dev/null &
 echo "$run_id"
@@ -153,7 +158,7 @@ python -u "stage1+llm_v2/run.py" resume \
   --run-id "$run_id" \
   --deepseek-config "stage1+llm/config/deepseek.local.json" \
   --stage2-device cuda \
-  --evaluation-budget 6 --max-attempts-per-round 3 \
+  --evaluation-budget 6 --max-attempts-per-round 3 --callback-timeout-seconds 30 \
   --thinking disabled --max-tokens 8192 --stream
 ```
 

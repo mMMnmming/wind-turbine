@@ -9,11 +9,20 @@ import threading
 import time
 from pathlib import Path
 
+from .planner import InfrastructureError
+
 
 class StrategyError(RuntimeError):
     def __init__(self, detail):
         self.detail = detail
         super().__init__(detail.get("error", "Strategy failed"))
+
+
+class StrategyCallbackTimeout(TimeoutError):
+    def __init__(self, operation, elapsed, limit):
+        self.detail = {"operation": operation, "elapsed_seconds": elapsed,
+                       "limit_seconds": limit, "reason": "callback_watchdog"}
+        super().__init__(f"{operation} did not return within {limit:g} seconds")
 
 
 class StrategyWorker:
@@ -38,29 +47,27 @@ class StrategyWorker:
                 if not line:
                     break
                 if len(line.encode("utf-8")) > 4_000_001 or not line.endswith("\n"):
-                    self.queue.put({"ok": False, "error": "Worker output exceeds protocol limit"})
+                    self.queue.put((time.perf_counter(), {"kind": "protocol_error", "error": "Worker output exceeds protocol limit"}))
                     break
                 try:
-                    self.queue.put(json.loads(line))
+                    self.queue.put((time.perf_counter(), json.loads(line)))
                 except ValueError:
-                    self.queue.put({"ok": False, "error": "Invalid worker JSON"})
+                    self.queue.put((time.perf_counter(), {"kind": "protocol_error", "error": "Invalid worker JSON"}))
                     break
         finally:
-            self.queue.put({"ok": False, "error": "Strategy worker disconnected"})
+            self.queue.put((time.perf_counter(), {"kind": "protocol_error", "error": "Strategy worker disconnected"}))
 
     def _stderr(self):
         for line in self.process.stderr:
             self.records.append("diagnostics/errors/worker-stderr.jsonl",
                                 {"scope": self.prefix, "text": line.rstrip()})
 
-    def exchange(self, payload, deadline, heartbeat, pulse):
+    def exchange(self, payload, timeout_seconds, heartbeat, pulse, *, operation):
         self.calls += 1
-        started = time.perf_counter()
         request_ref = self.records.blob(payload)
         self.records.append("diagnostics/tool_calls/" + self.prefix + ".jsonl",
                             {"call": self.calls, "direction": "input", "object": request_ref})
         encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False) + "\n"
-        # A strategy that stops reading must not block the supervisor's heartbeat.
         sent = threading.Event()
         send_errors = []
 
@@ -74,26 +81,58 @@ class StrategyWorker:
                 sent.set()
 
         threading.Thread(target=send, daemon=True).start()
-        next_pulse = time.perf_counter() + heartbeat
+        dispatched = time.perf_counter()
+        # Startup/transport hangs are infrastructure faults, not slow strategy code.
+        transport_deadline = dispatched + max(30.0, timeout_seconds)
+        callback_started = None
+        next_pulse = dispatched + heartbeat
         while True:
-            now = time.perf_counter()
-            if now >= deadline:
-                raise TimeoutError("search time budget exhausted while strategy executes")
             if sent.is_set() and send_errors:
-                raise StrategyError({"error": send_errors[0]})
+                raise InfrastructureError("Strategy transport failed: " + send_errors[0])
+            deadline = (callback_started + timeout_seconds if callback_started is not None
+                        else transport_deadline)
             try:
-                row = self.queue.get(timeout=min(0.25, deadline - now))
-                ref = self.records.blob(row)
-                self.records.append("diagnostics/tool_calls/" + self.prefix + ".jsonl",
-                                    {"call": self.calls, "direction": "output", "object": ref,
-                                     "wall_seconds": time.perf_counter() - started})
-                if not row.get("ok"):
-                    raise StrategyError(row)
-                return row
+                # Drain already received output BEFORE checking the supervisor clock.
+                # Slow diagnostic writes must not turn an on-time reply into a timeout.
+                received, row = self.queue.get_nowait()
             except queue.Empty:
-                if time.perf_counter() >= next_pulse:
-                    pulse()
-                    next_pulse = time.perf_counter() + heartbeat
+                now = time.perf_counter()
+                if now >= deadline:
+                    if callback_started is None:
+                        raise InfrastructureError("Strategy worker startup/transport timeout before callback start")
+                    raise StrategyCallbackTimeout(operation, now-callback_started, timeout_seconds)
+                try:
+                    received, row = self.queue.get(timeout=min(.25, deadline-now))
+                except queue.Empty:
+                    if time.perf_counter() >= next_pulse:
+                        pulse()
+                        next_pulse = time.perf_counter() + heartbeat
+                    continue
+            if not isinstance(row, dict) or row.get("kind") == "protocol_error":
+                raise InfrastructureError("Strategy protocol failed: " + str(row))
+            if row.get("kind") == "callback_started":
+                if callback_started is not None or row.get("operation") != operation:
+                    raise InfrastructureError("Unexpected strategy callback start")
+                callback_started = row["started_at"]
+                self.records.event("callback_started", scope=self.prefix, operation=operation,
+                                   call=self.calls, timeout_seconds=timeout_seconds)
+                continue
+            if callback_started is None:
+                raise InfrastructureError("Strategy response arrived before callback start")
+            if received > callback_started + timeout_seconds:
+                raise StrategyCallbackTimeout(operation, received-callback_started, timeout_seconds)
+            ref = self.records.blob(row)
+            self.records.append("diagnostics/tool_calls/" + self.prefix + ".jsonl",
+                                {"call": self.calls, "direction": "output", "object": ref,
+                                 "callback_wall_seconds": received-callback_started,
+                                 "exchange_wall_seconds": time.perf_counter()-dispatched})
+            if not row.get("ok"):
+                if row.get("kind") != "strategy_error":
+                    raise InfrastructureError("Unexpected strategy failure response")
+                raise StrategyError(row)
+            if row.get("kind") != ("initialized" if operation == "initialize" else "proposal"):
+                raise InfrastructureError("Unexpected strategy response kind")
+            return row
 
     def close(self):
         if self.process.poll() is None:
