@@ -181,12 +181,12 @@ class PlotChecks(unittest.TestCase):
             atomic_json(old/"summary.json", {"best_candidate": "C0001"})
             atomic_json(old/"diagnostics/evaluations/C0001.json", {"eligible": True, "status": "completed"})
             self.assertEqual(plot_main(["--run-dir", str(old)]), 0)
-            plotted = json.loads((old/"plots/C0001/plot_summary.json").read_text())
+            plotted = json.loads((old/"plots/C0001/paper/plot_summary.json").read_text())
             row = plotted["results"][0]
             self.assertEqual(row["nest_ids"], ["a", "c"])
             self.assertEqual(row["assignment_count"], 3)
             self.assertEqual(row["route_ids"]["a"], ["a", "b", "a"])
-            self.assertTrue((old/"plots/C0001/real102.pdf").is_file())
+            self.assertTrue((old/"plots/C0001/paper/real102.pdf").is_file())
             new = root/"new"
             saved_plot_fixture(new, "A0002")
             atomic_json(new/"summary.json", {"best_candidate": "C0001"})
@@ -197,14 +197,14 @@ class PlotChecks(unittest.TestCase):
                 "cases": {"C0001": entry}, "attempts": {"A0002": entry},
                 "expected_instances": ["real102", "missing-fixture"]})
             self.assertEqual(plot_main(["--run-dir", str(new), "--all-instances"]), 1)
-            summary = json.loads((new/"plots/C0001/plot_summary.json").read_text())
+            summary = json.loads((new/"plots/C0001/paper/plot_summary.json").read_text())
             self.assertEqual((summary["plotted"], summary["missing"], summary["errors"]), (1, 1, 0))
             failed_entry = {**entry, "eligible": False, "status": "candidate_error"}
             atomic_json(new/"diagnostics/runtime/candidate_index.json", {
                 "cases": {"C0001": entry}, "attempts": {"A0002": failed_entry},
                 "expected_instances": ["real102"]})
             self.assertEqual(plot_main(["--run-dir", str(new), "--candidate", "A0002"]), 0)
-            failed_plot = json.loads((new/"plots/A0002/plot_summary.json").read_text())
+            failed_plot = json.loads((new/"plots/A0002/paper/plot_summary.json").read_text())
             self.assertIn("NOT QUALIFIED", failed_plot["results"][0]["candidate_status"])
             external = root/"external"
             saved_plot_fixture(external, "external", "turbine102")

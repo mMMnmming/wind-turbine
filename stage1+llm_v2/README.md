@@ -169,39 +169,94 @@ python -u "stage1+llm_v2/run.py" evaluate \
 
 87仅用于算法冻结后的最终测试，必须显式传 `--final-test`；不能将其成绩用于后续进化。
 
-## 在服务器绘制部署和实际路线
+## 在服务器绘制论文风格部署图
 
-绘图只读保存的坐标、完整归属及最终独立审核路线，不运行生成代码，不加载Stage2，不请求LLM，不需要CUDA或桌面。使用Matplotlib的Agg后端，默认英文图例。
+绘图只读取已有坐标、完整归属及最终独立审核路线，不运行生成代码，不加载Stage2，不请求LLM，不需要CUDA或桌面。使用Matplotlib的Agg后端。
 
-绘制最好合格算法的真实102实例：
+默认 `--style paper` 参照 `stage1/run.py` 的实际绘图参数：6×7.5英寸、Times New Roman字号18、深蓝风机圆点s=30、红色黑边方形机巢s=30/边宽1.5、蓝色alpha=0.5空心服务半径圆、右上角字号16图例、虚线网格、等比例坐标及0.5km边距，300 DPI PNG和PDF。半径来自已保存配置，不重新计算。服务圆可能沿图框裁切，与Stage1相同。
 
-```bash
-python "stage1+llm_v2/plot_deployment.py" \
-  --run-dir "stage1+llm_v2/outputs/<运行ID>" \
-  --candidate best --instance real102
-```
+服务器缺少Times New Roman时依次使用Liberation Serif、DejaVu Serif，并只提示一次字体替代。默认论文图不显示路线、风向箭头、长标题和底部指标；指标、环境、来源及停止状态保存在 `plot_summary.json`。失败结果保留简短状态标记。
 
-指定合格案例，批量绘制各实例：
+- `--show-routes`：在论文图叠加已保存的实际闭环路线。
+- `--no-show-radius`：隐藏默认覆盖圆，`--show-radius`显式开启。
+- `--style diagnostic`：保留区域彩色分组、星形机巢、路线/风向及完整指标；可用 `--no-show-routes`隐藏路线。
+- `--output-dir`：指定输出目录；不指定时按候选和样式分目录，不覆盖之前的诊断图。
 
-```bash
-python "stage1+llm_v2/plot_deployment.py" \
-  --run-dir "stage1+llm_v2/outputs/<运行ID>" \
-  --candidate C0002 --all-instances
-```
+### 原有102及16个虚拟实例
 
-无LLM单独evaluate的结果：
+现有 `--all-instances` 已支持真实102、8个训练KDE、8个选择验证KDE，不重新采样：
 
 ```bash
 python "stage1+llm_v2/plot_deployment.py" \
-  --run-dir "stage1+llm_v2/outputs/<验证运行ID>" \
-  --candidate external --instance turbine102 --show-radius
+  --run-dir "stage1+llm_v2/outputs/<搜索运行ID>" \
+  --candidate best --all-instances --style paper
 ```
 
-失败尝试可以显式选择 `--candidate A0003`。当前旧版v2结果仍可直接选择原有C编号；脚本兼容旧v2、新案例索引和external结果。`best`没有合格候选时明确报错，不会退而选择失败尝试。
+默认 `--candidate best --instance real102`；`--instance` 与 `--all-instances` 互斥。可以显式选择合格案例C编号或失败尝试A编号。旧版v2原有C编号、新案例索引和单独evaluate的external结果均可读取。没有合格候选时 `best`报错，不会自动选择失败代码。
 
-默认 `--candidate best --instance real102`；`--instance` 与 `--all-instances` 互斥。可用 `--output-dir` 修改输出目录。图中风机按区域着色、机巢用星形标记、箭头表示保存的闭环路线；风箭头遵循Stage2的0北90东方向约定，不额外解释成气象风的来向。标注巢数、总航时、最长区域时间、最小续航余量、候选状态与停止原因。默认不画半径圆，`--show-radius`开启；超过12巢不逐一标注ID。
+### 接入87和189的独立评估结果
 
-每实例输出 `outputs/<运行ID>/plots/<候选ID>/<实例>.png` 和同名PDF；同目录 `plot_summary.json` 记录来源文件、指标、实际路线及完成/缺失/错误数量。批量模式保留已完成图，对缺失实例和格式错误逐项报告；有缺失或错误时退出码1，全成功为0。必要数据缺失不会补造坐标、归属或路线。绘图默认手动执行，不拖慢搜索。
+`--extra-run-dir` 可重复传入，自动读取保存的 `external/turbine87`、`external/turbine189` 坐标和结果，核对实际风机数量，并核对与选定候选的源码一致（仅忽略换行符差异）。缺失源码、数量不符或源码不同均报告，不补造或混用结果。重复实例不会覆盖前一张图。
+
+两个额外风场必须已有部署结果，仅有原始TSV不能画出算法部署。若已有结果，跳过下面的评估步骤。否则在服务器对冻结的同一个候选运行**现有**无LLM评估命令；这两条命令会运行算法和Stage2，不由绘图脚本自动执行：
+
+```bash
+search_run="填写搜索运行ID"
+candidate="C0002"
+run87="final87-$(date +%Y%m%d_%H%M%S)"
+run189="final189-$(date +%Y%m%d_%H%M%S)"
+
+python -u "stage1+llm_v2/run.py" evaluate \
+  --candidate "stage1+llm_v2/outputs/$search_run/candidates/$candidate.py" \
+  --input turbine87.tsv --final-test \
+  --stage2-device cuda --run-id "$run87"
+
+python -u "stage1+llm_v2/run.py" evaluate \
+  --candidate "stage1+llm_v2/outputs/$search_run/candidates/$candidate.py" \
+  --input turbine189.tsv --final-test \
+  --stage2-device cuda --run-id "$run189"
+```
+
+189包含87的全部共享坐标，因此两者均使用现有 `--final-test` 入口；不修改数据隔离或算法逻辑，不把额外结果送回搜索选优。
+
+一次绘制全部19个实例（前提是结果齐全）：
+
+```bash
+python "stage1+llm_v2/plot_deployment.py" \
+  --run-dir "stage1+llm_v2/outputs/$search_run" \
+  --candidate "$candidate" --all-instances \
+  --extra-run-dir "stage1+llm_v2/outputs/$run87" \
+  --extra-run-dir "stage1+llm_v2/outputs/$run189" \
+  --style paper
+```
+
+单独绘制189：
+
+```bash
+python "stage1+llm_v2/plot_deployment.py" \
+  --run-dir "stage1+llm_v2/outputs/$run189" \
+  --candidate external --instance turbine189 --style paper
+```
+
+单独绘制87时替换为 `$run87` 和 `--instance turbine87`。单独external绘图无需关联搜索目录。也可继续单独绘制 `turbine102`。
+
+### 输出与状态
+
+默认输出：
+
+```text
+outputs/<搜索运行ID>/plots/<候选ID>/paper/
+  real102.png / real102.pdf
+  training-kde-000.png / training-kde-000.pdf
+  ...
+  turbine87.png / turbine87.pdf
+  turbine189.png / turbine189.pdf
+  plot_summary.json
+```
+
+`diagnostic`风格输出到同级diagnostic目录。`plot_summary.json`逐项记录来源运行、坐标/结果文件、指标、实际路线、风机数量及绘图样式；额外87/189标记为独立评估，只汇总绘图数量，不并入17实例选优指标，不改写源结果。批量绘图保留成功图片，逐项报告缺失及异常；全成功退出码0，有缺失/错误为1。
+
+绘图默认手动执行，不影响搜索预算。历史结果可以直接绘图，无需resume搜索；现有搜索恢复校验包含模块源指纹，如果还需恢复旧搜索，应保留该搜索的原代码版本。本次不更改恢复或算法规则。
 
 ## 本次交付范围
 
