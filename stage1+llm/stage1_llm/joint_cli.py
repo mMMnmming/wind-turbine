@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, replace
 import json
-from pathlib import Path
 import sys
 import time
+from dataclasses import asdict, replace
+from pathlib import Path
 
 from .artifacts import RunArtifacts, run_path, validate_run_id
 from .data import prepare_data
@@ -18,7 +18,7 @@ from .joint_artifacts import (
     list_joint_candidates,
     verify_selection,
 )
-from .joint_planner import PlannerService, InfrastructureError
+from .joint_planner import InfrastructureError, PlannerService
 from .joint_search import JointSearch
 from .joint_settings import DEFAULT_CONFIG, load_joint_settings
 from .joint_tools import JointTools
@@ -70,6 +70,8 @@ def parser():
         sub.add_argument("--reasoning-effort", choices=("low", "high", "max"))
         sub.add_argument("--max-tokens", type=int)
         sub.add_argument("--api-retries", type=int)
+        sub.add_argument("--search-mode", choices=("standard", "focused_six"))
+        sub.add_argument("--seed-candidate", type=Path)
     subs.choices["resume"].add_argument(
         "--resume-run-id", type=validate_run_id, required=True
     )
@@ -103,6 +105,13 @@ def main(argv=None):
                 print(export_joint_candidate(root, args.candidate_id), flush=True)
             return 0
         joint = load_joint_settings(args.search_config)
+        saved_run = None
+        if args.command == "resume":
+            saved_run = json.loads(
+                (
+                    run_path(args.outputs, args.resume_run_id) / "search_state.json"
+                ).read_text(encoding="utf-8")
+            )
         overrides = {}
         for name in (
             "evaluation_budget",
@@ -113,7 +122,29 @@ def main(argv=None):
             value = getattr(args, name, None)
             if value is not None:
                 overrides[name] = value
-        joint = replace(joint, search=replace(joint.search, **overrides))
+        joint_overrides = {}
+        if (
+            saved_run is not None
+            and saved_run["identity"].get("search_mode") == "focused_six"
+        ):
+            joint_overrides.update(
+                search_mode="focused_six",
+                seed_candidate=run_path(args.outputs, args.resume_run_id)
+                / "seeds/0000.py",
+            )
+            if args.evaluation_budget is None:
+                overrides["evaluation_budget"] = saved_run["evaluation_budget"]
+            if args.no_improvement_limit is None:
+                overrides["no_improvement_limit"] = saved_run["identity"]["settings"][
+                    "no_improvement_limit"
+                ]
+        if getattr(args, "search_mode", None) is not None:
+            joint_overrides["search_mode"] = args.search_mode
+        if getattr(args, "seed_candidate", None) is not None:
+            joint_overrides["seed_candidate"] = args.seed_candidate.resolve()
+        joint = replace(
+            joint, search=replace(joint.search, **overrides), **joint_overrides
+        )
         if args.stage2_checkpoint:
             joint = replace(joint, checkpoint=args.stage2_checkpoint.resolve())
         if args.stage2_device:
@@ -141,7 +172,7 @@ def main(argv=None):
                 flush=True,
             )
             if args.command == "check-model":
-                from .joint_planner import GreedyDecoder, CheckedPlanner
+                from .joint_planner import CheckedPlanner, GreedyDecoder
 
                 points = load_turbines(args.input or joint.search.target_input)[:4]
                 expected = planner.region(points, points[0].identifier)

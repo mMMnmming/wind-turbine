@@ -1,6 +1,7 @@
 """Candidate source and proposal contracts."""
 
 from __future__ import annotations
+
 import ast
 import symtable
 from dataclasses import dataclass
@@ -170,7 +171,15 @@ def validate_candidate_source(source: str) -> None:
         }
     )
     if unknown:
+        references = [
+            f"{node.id} at line {node.lineno}: {source.splitlines()[node.lineno - 1].strip()[:120]}"
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id in unknown
+        ][:3]
         raise ValueError(
             f"Names not available in candidate runtime: {', '.join(unknown)}. "
-            "Use the documented builtins or define/import the helper explicitly."
+            "Use the documented builtins or define/import the helper explicitly. "
+            + " | ".join(references)
         )

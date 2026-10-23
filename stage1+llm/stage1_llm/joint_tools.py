@@ -1,15 +1,19 @@
-"""Tool contract v4: all route feasibility comes from the frozen Stage2 actor."""
+"""Tool contract v5: explicit structural moves and frozen wind-aware routing."""
 
 from __future__ import annotations
 
 import copy
 import inspect
 import math
-from .candidate_tools import CandidateTools, BudgetExceeded
+from collections import Counter
+
+from .candidate_tools import BudgetExceeded, CandidateTools
 from .candidate_tools import ToolContractError as ToolContractError
 from .domain import DeploymentConfig, Turbine
+from .joint_evidence import SearchEvidence
+from .joint_moves import transform, validate
 
-TOOLS_VERSION = 4
+TOOLS_VERSION = 5
 PUBLIC_METHODS = (
     "distance",
     "directed_time",
@@ -26,6 +30,10 @@ PUBLIC_METHODS = (
     "make_proposal",
     "assignments_from_proposal",
     "better_metrics",
+    "reassign_tasks",
+    "remove_nest",
+    "relocate_nest",
+    "merge_nests",
 )
 
 
@@ -68,11 +76,16 @@ class JointTools(CandidateTools):
         self, points: list[Turbine], config: DeploymentConfig, *, planner, **kwargs
     ):
         super().__init__(points, config, **kwargs)
-        from stage2.atsp import WindATSPConfig, WindATSPInstance
         import numpy as np
+
+        from stage2.atsp import WindATSPConfig, WindATSPInstance
 
         self._planner = planner
         self._requests = 0
+        self._evidence = SearchEvidence()
+        self._lifetime_post_repair_calls = 0
+        self._region_failure_counts = Counter()
+        self._operation_counts = Counter()
         self._times = WindATSPInstance(
             tuple(p.identifier for p in self.points),
             np.asarray([(p.x_km, p.y_km) for p in self.points]),
@@ -80,7 +93,7 @@ class JointTools(CandidateTools):
             WindATSPConfig(**planner.metadata["environment"]),
         ).travel_time_seconds
 
-    def region(self, nest_id: str, members) -> dict:
+    def _region(self, nest_id: str, members) -> dict:
         self._check()
         self._query_id("region", "nest_id", nest_id)
         if not isinstance(members, (list, tuple, set, frozenset)):
@@ -163,7 +176,13 @@ class JointTools(CandidateTools):
         self._cache[key] = copy.deepcopy(result)
         return self._result(result, "region")
 
-    def deployment(self, proposal: dict) -> dict:
+    def region(self, nest_id: str, members) -> dict:
+        checked = self._region(nest_id, members)
+        for diagnostic in checked["diagnostics"]:
+            self._region_failure_counts[diagnostic["kind"]] += 1
+        return checked
+
+    def _deployment(self, proposal: dict) -> dict:
         self._check()
         self._proposal_schema("deployment", proposal)
         nests, assignments = proposal["nest_ids"], proposal["assignments"]
@@ -179,7 +198,23 @@ class JointTools(CandidateTools):
             return self._result(
                 {
                     "feasible": False,
-                    "diagnostics": [{"kind": "coverage_or_self_assignment"}],
+                    "diagnostics": [
+                        {
+                            "kind": "coverage_or_self_assignment",
+                            "missing_ids": sorted(set(self._by_id) - set(assignments))[
+                                :5
+                            ],
+                            "extra_ids": sorted(set(assignments) - set(self._by_id))[
+                                :5
+                            ],
+                            "invalid_targets": sorted(
+                                set(assignments.values()) - set(nests)
+                            )[:5],
+                            "invalid_self_assignments": sorted(
+                                n for n in nests if assignments.get(n) != n
+                            )[:5],
+                        }
+                    ],
                     "regions": [],
                     "metrics": None,
                     "objectives": None,
@@ -227,6 +262,48 @@ class JointTools(CandidateTools):
             "deployment",
         )
 
+    def deployment(self, proposal: dict) -> dict:
+        checked = self._deployment(proposal)
+        self._evidence.observe(proposal, checked)
+        return checked
+
+    def _move(self, operation, assignments, **params):
+        self.tick()
+        self._operation_counts[operation] += 1
+        try:
+            result = transform(assignments, self._by_id, operation, **params)
+        except (ValueError, TypeError) as error:
+            self._error(operation, "assignments/updates", str(error), assignments)
+        self._evidence.observe_move(assignments, result["assignments"])
+        return self._result(result, operation)
+
+    def reassign_tasks(self, assignments: dict, updates: dict) -> dict:
+        return self._move("reassign_tasks", assignments, updates=updates)
+
+    def remove_nest(self, assignments: dict, nest_id: str, updates: dict) -> dict:
+        return self._move("remove_nest", assignments, source=nest_id, updates=updates)
+
+    def relocate_nest(self, assignments: dict, old_nest: str, new_nest: str) -> dict:
+        return self._move(
+            "relocate_nest", assignments, source=old_nest, target=new_nest
+        )
+
+    def merge_nests(
+        self, assignments: dict, source_nest: str, target_nest: str
+    ) -> dict:
+        return self._move(
+            "merge_nests", assignments, source=source_nest, target=target_nest
+        )
+
+    def _record_external_call(self, name):
+        super()._record_external_call(name)
+        if self._last_repair_proposal is not None and name in ("region", "deployment"):
+            self._lifetime_post_repair_calls += 1
+
+    def finalize_return(self, proposal):
+        # No additional inference or budget-consuming audit at worker shutdown.
+        self._evidence.mark(proposal, returned=True)
+
     def remember(self, proposal: dict) -> bool:
         self._proposal_schema("remember", proposal)
         if not self.deployment(proposal)["feasible"]:
@@ -235,6 +312,7 @@ class JointTools(CandidateTools):
             self._best is None or self._best["assignments"] != proposal["assignments"]
         )
         self._best = copy.deepcopy(dict(proposal))
+        self._evidence.mark(proposal)
         if (
             changed
             and self._last_repair_proposal is not None
@@ -259,7 +337,14 @@ class JointTools(CandidateTools):
 
     def stats(self) -> dict:
         result = dict(super().stats())
-        result.update(tools_version=TOOLS_VERSION, region_requests=self._requests)
+        result.update(
+            tools_version=TOOLS_VERSION,
+            region_requests=self._requests,
+            search_evidence=self._evidence.snapshot(),
+            region_failure_counts=dict(self._region_failure_counts),
+            structural_move_attempts=dict(self._operation_counts),
+            lifetime_post_repair_evaluation_calls=self._lifetime_post_repair_calls,
+        )
         return self._result(result, "stats")
 
     def _repair(self, assignments: dict, grouped: bool):
@@ -268,9 +353,10 @@ class JointTools(CandidateTools):
         if set(assignments) != set(self._by_id) or not set(assignments.values()) <= set(
             self._by_id
         ):
-            self._error(
-                name, "assignments", "complete mapping to input IDs", assignments
-            )
+            try:
+                validate(assignments, self._by_id)
+            except ValueError as error:
+                self._error(name, "assignments", str(error), assignments)
         self._repair_start(name)
         answer = dict(assignments)
         for nest in set(answer.values()):
@@ -335,6 +421,10 @@ def tool_reference() -> str:
         "remaining": "返回seconds,region_evaluations,move_attempts字典。",
         "split_repair": "完整assignments映射→完整proposal，显式新增单点机巢修复，不自动保存。",
         "repartition_repair": "完整assignments映射→完整proposal，以网络贪心可行性重组违规区域，不自动保存/优化。",
+        "reassign_tasks": "完整映射+非机巢任务updates→{assignments,affected_nests}，保持巢数；结构操作不审核物理约束。",
+        "remove_nest": "完整映射+源巢+其全部成员(含旧巢风机)的新归属updates→{assignments,affected_nests}；目标为剩余巢。",
+        "relocate_nest": "完整映射+旧巢+非机巢新位置→{assignments,affected_nests}，保留旧巢任务，含新位置原归属区域。",
+        "merge_nests": "完整映射+源巢+目标巢→{assignments,affected_nests}，源巢风机继续作为任务。",
     }
     return "\n".join(
         f"{name}{str(inspect.signature(getattr(JointTools, name))).replace('self, ', '')}: {notes.get(name, '沿用严格工具契约；输入ID必须为字符串。')}"

@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import asdict
 import hashlib
 import json
 import logging
 import math
 import multiprocessing
-from pathlib import Path
 import sys
 import time
+from dataclasses import asdict
+from pathlib import Path
 
 from .domain import DeploymentConfig, Turbine
 from .sandbox import CandidateDeadlineExceeded
@@ -61,7 +61,9 @@ class GreedyDecoder:
         self, checkpoint: Path, device: str, config: DeploymentConfig, gust: float
     ):
         import torch
+
         from stage2.policy import build_policy
+
         from .artifacts import sha256_file
 
         if device not in ("cpu", "cuda"):
@@ -132,6 +134,7 @@ class CheckedPlanner:
 
     def region(self, points: list[Turbine], nest: str) -> dict:
         import numpy as np
+
         from stage2.atsp import WindATSPConfig, WindATSPInstance
 
         self.requests += 1
@@ -231,6 +234,25 @@ class CheckedPlanner:
             "route_ids": [instance.identifiers[i] for i in route],
             "runtime_seconds": runtime,
             "cache_key": key,
+            "wind_audit": {
+                "environment_fingerprint": hashlib.sha256(
+                    json.dumps(self.env, sort_keys=True).encode()
+                ).hexdigest(),
+                "environment": dict(self.env),
+                "closed_flight_seconds": metrics.flight_seconds,
+                "leg_seconds": [
+                    float(instance.travel_time_seconds[a, b])
+                    for a, b in zip(route, route[1:])
+                ],
+                "return_leg_seconds": float(
+                    instance.travel_time_seconds[route[-2], route[-1]]
+                ),
+                "hover_equivalent_seconds": metrics.equivalent_energy_seconds
+                - metrics.flight_seconds,
+                "endurance_margin_seconds": margin,
+                "route_verified": True,
+                "gust_semantics": "Stage2 input feature; no stochastic gust safety claim",
+            },
         }
         self.cache[key] = copy.deepcopy(result)
         return {**result, "cache_hit": False}
@@ -241,6 +263,11 @@ class CheckedPlanner:
             "inferences": self.inferences,
             "cache_hits": self.hits,
         }
+
+    def reset_cache(self):
+        """Reset benchmark state, retaining the frozen loaded decoder."""
+        self.cache.clear()
+        self.requests = self.inferences = self.hits = 0
 
 
 def _serve(connection, checkpoint: str, device: str, config: dict, gust: float):
@@ -256,6 +283,10 @@ def _serve(connection, checkpoint: str, device: str, config: dict, gust: float):
             if request is None:
                 break
             try:
+                if request.get("command") == "reset_cache":
+                    planner.reset_cache()
+                    connection.send({"ok": True, "stats": planner.stats()})
+                    continue
                 result = planner.region(
                     [Turbine(**p) for p in request["points"]], request["nest"]
                 )
@@ -367,3 +398,14 @@ class PlannerService:
 
     def stats(self):
         return dict(self.counters)
+
+    def reset_cache(self):
+        self.settle()
+        try:
+            self.connection.send({"command": "reset_cache"})
+        except (OSError, EOFError) as error:
+            raise InfrastructureError(
+                "Stage2 worker unavailable for cache reset."
+            ) from error
+        self._pending_started = time.perf_counter()
+        self.counters = self._receive(self.timeout)["stats"]

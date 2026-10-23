@@ -3,22 +3,30 @@
 from __future__ import annotations
 
 import csv
-from contextlib import contextmanager
-from dataclasses import asdict
-from datetime import datetime, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
 import time
+from contextlib import contextmanager
+from dataclasses import asdict
+from datetime import datetime, timezone
+from pathlib import Path
 from uuid import uuid4
 
 from .artifacts import RunArtifacts, atomic_text, redact_secrets, run_path, safe_child
 from .candidate import CANDIDATE_BUILTINS, validate_candidate_source
 from .data import fingerprint, prepare_data, turbines_from_record
 from .domain import Turbine
+from .joint_evidence import assignment_hash
 from .joint_planner import InfrastructureError
-from .joint_tools import JointTools, aggregate_metrics, ranking_key, tool_reference
+from .joint_provenance import source_provenance
+from .joint_tools import (
+    TOOLS_VERSION,
+    JointTools,
+    aggregate_metrics,
+    ranking_key,
+    tool_reference,
+)
 from .sandbox import CandidateExecutionError, run_candidate
 from .search import SearchController
 
@@ -54,14 +62,29 @@ class JointSearch(SearchController):
     def __init__(self, joint, llm, outputs, planner, client=None):
         super().__init__(joint.search, llm, outputs, client)
         self.joint, self.planner = joint, planner
+        self.seed_row = None
+        self._identity_seed_path = joint.seed_candidate
 
     def _identity(self, bundle, system):
         identity = super()._identity(bundle, system)
         identity.update(
             search_version=5,
-            tool_contract_version=4,
+            tool_contract_version=TOOLS_VERSION,
             objective_version=OBJECTIVE,
             stage2=self.planner.metadata,
+            search_mode=self.joint.search_mode,
+            seed_sha256=(
+                hashlib.sha256(
+                    self._identity_seed_path.read_text(encoding="utf-8").encode()
+                ).hexdigest()
+                if self._identity_seed_path is not None
+                else None
+            ),
+            seed_provenance=(
+                source_provenance(self._identity_seed_path)
+                if self._identity_seed_path
+                else None
+            ),
         )
         return identity
 
@@ -70,7 +93,8 @@ class JointSearch(SearchController):
             "search_state.json",
             {
                 "search_version": 5,
-                "tool_contract_version": 4,
+                "tool_contract_version": TOOLS_VERSION,
+                "seed_candidate": self.seed_row,
                 "identity": self.identity,
                 "evaluation_budget": self.settings.evaluation_budget,
                 "archive": self.archive,
@@ -102,6 +126,7 @@ class JointSearch(SearchController):
             state["history"],
         )
         self.pending, self.stalled = state["pending"], state["stalled"]
+        self.seed_row = state.get("seed_candidate")
         self.elapsed_seconds = state["active_search_seconds"]
         self.bandit.load_state_dict(state["ucb"])
 
@@ -109,7 +134,11 @@ class JointSearch(SearchController):
             return tuple(tuples(v) for v in value) if isinstance(value, list) else value
 
         self.rng.setstate(tuples(state["rng_state"]))
-        for row in [*self.history, *([self.pending] if self.pending else [])]:
+        for row in [
+            *self.history,
+            *([self.seed_row] if self.seed_row else []),
+            *([self.pending] if self.pending else []),
+        ]:
             if row.get("source_path"):
                 source_path = safe_child(artifacts.root, row["source_path"])
                 if row.get("stage") == "source_ready":
@@ -124,6 +153,18 @@ class JointSearch(SearchController):
                     raise ValueError("Saved candidate source hash changed.")
 
     def _choose(self):
+        if self.joint.search_mode == "focused_six":
+            direction = (
+                "reduce_route_distance",
+                "reduce_route_distance",
+                "reduce_nests",
+            )[len(self.history) % 3]
+            return (
+                self.archive[0],
+                direction,
+                {"schedule": "fixed_k,fixed_k,reduce"},
+                "focused_elite",
+            )
         independent = sum(
             r["selection_reason"] == "independent_initial" for r in self.history
         )
@@ -172,6 +213,17 @@ class JointSearch(SearchController):
             "environment": self.planner.metadata["environment"],
             "work_limits": self._limits(),
             "dataset_count": len(self.bundle["datasets"]),
+            "search_mode": self.joint.search_mode,
+            "direction_instruction": (
+                "主要保持每实例机巢数K，迁巢/搬移/交换降低实际网络总飞行时间；同总时间再降低最长区域时间。"
+                if direction == "reduce_route_distance"
+                else (
+                    "主要尝试撤巢并联合重分配全部成员（包含原巢风机）；保持全部约束。"
+                    if direction == "reduce_nests"
+                    else "保持完整覆盖，改进部署策略。"
+                )
+            ),
+            "best_objectives": self.archive[0]["objectives"] if self.archive else None,
         }
         source = "无，从零生成完整算法。"
         if parent:
@@ -191,12 +243,56 @@ class JointSearch(SearchController):
                         evaluation.get("datasets", []),
                         key=lambda d: (
                             d["feasible"],
+                            -(d.get("metrics") or {}).get("nest_count", 0),
+                            (d.get("metrics") or {}).get(
+                                "minimum_endurance_margin_seconds", 0
+                            ),
                             -max(
                                 (x.get("excess", 0) for x in d.get("diagnostics", [])),
                                 default=0,
                             ),
                         ),
                     )[: self.settings.feedback_dataset_limit]
+                ],
+                "execution_feedback": [
+                    {
+                        "name": d["name"],
+                        "search_evidence": d.get("telemetry", {}).get(
+                            "search_evidence"
+                        ),
+                        "termination": d.get("telemetry", {}).get("termination"),
+                        "region_failure_counts": d.get("telemetry", {}).get(
+                            "region_failure_counts", {}
+                        ),
+                        "structural_move_attempts": d.get("telemetry", {}).get(
+                            "structural_move_attempts", {}
+                        ),
+                        "region_extremes": {
+                            "longest": self._region_brief(
+                                max(
+                                    d.get("regions", []),
+                                    key=lambda r: r.get("flight_seconds", 0),
+                                    default={},
+                                )
+                            ),
+                            "tightest": self._region_brief(
+                                min(
+                                    d.get("regions", []),
+                                    key=lambda r: r.get("endurance_margin_seconds", 0),
+                                    default={},
+                                )
+                            ),
+                        },
+                    }
+                    for d in sorted(
+                        evaluation.get("datasets", []),
+                        key=lambda d: (
+                            d["feasible"],
+                            (d.get("metrics") or {}).get(
+                                "minimum_endurance_margin_seconds", 0
+                            ),
+                        ),
+                    )[:2]
                 ],
             }
             source = safe_child(artifacts.root, parent["source_path"]).read_text(
@@ -216,6 +312,18 @@ class JointSearch(SearchController):
             for r in self.history[-3:]
         ]
         return f"固定评测反馈（不是87测试成绩）：{json.dumps(feedback,ensure_ascii=False,allow_nan=False)}\n父代完整源码：\n{source}"
+
+    @staticmethod
+    def _region_brief(region):
+        return {
+            k: region.get(k)
+            for k in (
+                "nest_id",
+                "task_count",
+                "flight_seconds",
+                "endurance_margin_seconds",
+            )
+        }
 
     def _execute(self, artifacts, row, points, label, timeout):
         telemetry = {}
@@ -268,6 +376,12 @@ class JointSearch(SearchController):
                 soft_seconds=self.settings.candidate_timeout_seconds,
             ).deployment(asdict(proposal))
         )
+        if "search_evidence" in telemetry:
+            telemetry["search_evidence"]["returned"] = {
+                "assignment_sha256": assignment_hash(asdict(proposal)["assignments"]),
+                "objectives": checked["objectives"],
+                "independently_checked": True,
+            }
         return (
             proposal,
             checked,
@@ -317,6 +431,19 @@ class JointSearch(SearchController):
             cases += [
                 ("radius", [Turbine("a", 0, 0), Turbine("b", 20, 0)]),
                 ("cluster", [Turbine(str(i), i * 0.2, 0) for i in range(5)]),
+                (
+                    "two_regions",
+                    [
+                        Turbine("a", 0, 0),
+                        Turbine("b", 0.1, 0),
+                        Turbine("c", 20, 0),
+                        Turbine("d", 20.1, 0),
+                    ],
+                ),
+                (
+                    "radius_boundary",
+                    [Turbine("a", 0, 0), Turbine("b", 6.9, 0), Turbine("c", 6.8, 0.1)],
+                ),
             ]
         for label, points in cases:
             if label in row.get("completed_preflight", []):
@@ -387,7 +514,10 @@ class JointSearch(SearchController):
                 behavior
                 and any(
                     r["evaluation"].get("behavior_sha256") == behavior
-                    for r in self.history
+                    for r in [
+                        *self.history,
+                        *([self.seed_row] if self.seed_row else []),
+                    ]
                 )
             ),
             "violations": [
@@ -409,7 +539,12 @@ class JointSearch(SearchController):
     def _finish(self, artifacts, row, evaluation):
         before = tuple(self.archive[0]["objectives"]) if self.archive else None
         parent = next(
-            (r for r in self.history if r["candidate_id"] == row["parent_id"]), None
+            (
+                r
+                for r in [*self.history, *([self.seed_row] if self.seed_row else [])]
+                if r["candidate_id"] == row["parent_id"]
+            ),
+            None,
         )
         row.update(
             evaluation=evaluation,
@@ -417,6 +552,24 @@ class JointSearch(SearchController):
             origin="offline_mock" if self.mock else "llm",
         )
         feasible, duplicate = evaluation["feasible"], evaluation.get("duplicate", False)
+        if row["selection_reason"] == "imported_seed":
+            row["origin"] = (
+                "offline_mock"
+                if self.mock
+                else "imported_" + row["provenance"]["origin"] + "_seed"
+            )
+            self.seed_row = row
+            self.pending = None
+            if feasible and evaluation.get("complete"):
+                self.archive = [row]
+            self._persist(artifacts)
+            artifacts.write_json("seed_evaluation.json", row)
+            if not feasible:
+                raise ValueError(
+                    "Imported seed failed re-evaluation; no LLM request made."
+                )
+            self._reports(artifacts)
+            return
         parent_key = (
             tuple(parent["objectives"]) if parent and parent.get("objectives") else None
         )
@@ -444,13 +597,22 @@ class JointSearch(SearchController):
             )[:6]
         if not feasible and row.get("source_path") and not duplicate:
             self.repair_pool = [*self.repair_pool, row][-6:]
-        row.update(reward=reward, decision=decision)
+        row.update(
+            reward=reward,
+            decision=decision,
+            improvement_vs_parent=bool(
+                feasible and parent_key and tuple(row["objectives"]) < parent_key
+            ),
+            improvement_vs_global_best=bool(
+                feasible and before and tuple(row["objectives"]) < before
+            ),
+        )
         if parent_key and row.get("objectives"):
             row["objective_delta"] = [
                 a - b for a, b in zip(row["objectives"], parent_key)
             ]
         if (
-            row["selection_reason"] != "independent_initial"
+            row["selection_reason"] not in ("independent_initial", "focused_elite")
             and evaluation["status"] != "generation_error"
         ):
             self.bandit.update(row["direction_id"], reward)
@@ -486,6 +648,8 @@ class JointSearch(SearchController):
             "reward",
             "objectives",
             "llm_seconds",
+            "improvement_vs_parent",
+            "improvement_vs_global_best",
         ]
         import io
 
@@ -527,6 +691,59 @@ class JointSearch(SearchController):
                 ]
             )
         atomic_text(artifacts.root / "ranking.csv", "\ufeff" + buffer.getvalue())
+        artifacts.write_json(
+            "instance_metrics.json",
+            [
+                {
+                    "candidate_id": row["candidate_id"],
+                    "origin": row["origin"],
+                    "instances": [
+                        {
+                            "name": d["name"],
+                            "split": d["split"],
+                            "metrics": d["metrics"],
+                        }
+                        for d in row["evaluation"]["datasets"]
+                    ],
+                }
+                for row in self.archive
+            ],
+        )
+
+    def _ensure_seed(self, artifacts):
+        if self.joint.search_mode != "focused_six":
+            return
+        if self.seed_row is not None:
+            if not self.seed_row["evaluation"]["feasible"]:
+                raise ValueError(
+                    "Imported seed failed; create a new run with a valid seed."
+                )
+            return
+        if self.pending is None:
+            source = self.joint.seed_candidate.read_text(encoding="utf-8")
+            if redact_secrets(source, (self.llm.api_key,)) != source:
+                raise ValueError("Seed contains sensitive-looking content.")
+            artifacts.write_text("seeds/0000.py", source)
+            self.pending = {
+                "index": 0,
+                "candidate_id": "S0000",
+                "parent_id": None,
+                "selection_reason": "imported_seed",
+                "direction_id": "constraint_repair",
+                "stage": "evaluation",
+                "source_path": "seeds/0000.py",
+                "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+                "seed_source": str(self.joint.seed_candidate),
+                "llm_seconds": 0,
+                "provenance": source_provenance(self.joint.seed_candidate),
+            }
+            self._persist(artifacts)
+        artifacts.log(
+            "Re-evaluating explicit seed on the complete frozen search set; no API request",
+            event="seed_start",
+        )
+        evaluation = self._evaluate(artifacts, self.pending)
+        self._finish(artifacts, self.pending, evaluation)
 
     def run(self, run_id=None, *, resume=False, reset_stall=False):
         if resume and not run_id:
@@ -541,6 +758,10 @@ class JointSearch(SearchController):
             return self._run_locked(run_id, resume=resume, reset_stall=reset_stall)
 
     def _run_locked(self, run_id, *, resume=False, reset_stall=False):
+        if resume and self.joint.search_mode == "focused_six":
+            archived_seed = run_path(self.outputs, run_id) / "seeds/0000.py"
+            if archived_seed.is_file():
+                self._identity_seed_path = archived_seed
         self.bundle = prepare_data(self.settings)
         system = (
             Path(__file__).resolve().parents[1] / "prompts/system-v5.md"
@@ -579,6 +800,7 @@ class JointSearch(SearchController):
         )
         self._persist(artifacts)
         try:
+            self._ensure_seed(artifacts)
             while (
                 len(self.history) < self.settings.evaluation_budget
                 and self.stalled < self.settings.no_improvement_limit
@@ -746,7 +968,12 @@ class JointSearch(SearchController):
             "summary.json",
             {
                 "search_version": 5,
-                "tool_contract_version": 4,
+                "tool_contract_version": TOOLS_VERSION,
+                "search_mode": self.joint.search_mode,
+                "seed_candidate": (
+                    self.seed_row["candidate_id"] if self.seed_row else None
+                ),
+                "cache_policy": "shared_search_cache; benchmark uses cold_candidate_instance",
                 "origin": "offline_mock" if self.mock else "llm",
                 "status": (
                     "best_within_budget"

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
 import hashlib
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 from .artifacts import atomic_json, atomic_text, safe_child
@@ -18,6 +18,8 @@ RUNTIME_FILES = {
     "sandbox.py",
     "joint_tools.py",
     "joint_planner.py",
+    "joint_moves.py",
+    "joint_evidence.py",
 }
 
 
@@ -63,7 +65,12 @@ def verify_selection(candidate: Path, metadata: dict):
         != record["source_sha256"]
     ):
         raise ValueError("Selected source hash changed.")
-    if set(record["runtime_hashes"]) != RUNTIME_FILES:
+    required = (
+        RUNTIME_FILES
+        if record.get("tool_contract_version", 4) >= 5
+        else RUNTIME_FILES - {"joint_moves.py", "joint_evidence.py"}
+    )
+    if set(record["runtime_hashes"]) != required:
         raise ValueError("Incomplete selected runtime manifest.")
     for name, digest in record["runtime_hashes"].items():
         if (
@@ -79,7 +86,10 @@ def export_joint_candidate(root: Path, candidate_id=None, *, allow_mock=False):
     state = read_state(root)
     eligible = [
         r
-        for r in state["history"]
+        for r in [
+            *state["history"],
+            *([state["seed_candidate"]] if state.get("seed_candidate") else []),
+        ]
         if r["evaluation"]["feasible"] and r["evaluation"].get("complete")
     ]
     if candidate_id is None:
@@ -98,7 +108,8 @@ def export_joint_candidate(root: Path, candidate_id=None, *, allow_mock=False):
     for name in RUNTIME_FILES:
         content = (Path(__file__).parent / name).read_bytes().replace(b"\r\n", b"\n")
         if (
-            hashlib.sha256(content).hexdigest()
+            name not in state["identity"]["implementation"]
+            or hashlib.sha256(content).hexdigest()
             != state["identity"]["implementation"][name]
         ):
             raise ValueError(
@@ -117,7 +128,7 @@ def export_joint_candidate(root: Path, candidate_id=None, *, allow_mock=False):
         output / "selection.json",
         {
             "search_version": 5,
-            "tool_contract_version": 4,
+            "tool_contract_version": state["tool_contract_version"],
             "candidate_id": candidate_id,
             "origin": row["origin"],
             "source_sha256": row["source_sha256"],
@@ -133,6 +144,8 @@ def export_joint_candidate(root: Path, candidate_id=None, *, allow_mock=False):
         )
     )
     saved_config.update(state["identity"]["settings"])
+    # Exported evaluation is independent of the search's seed/schedule.
+    saved_config.update(search_mode="standard", seed_candidate=None)
     saved_config.update(
         stage2_device=state["identity"]["stage2"].get("device", "cpu"),
         gust_speed_mps=state["identity"]["stage2"]["environment"]["gust_speed_mps"],
@@ -164,9 +177,10 @@ def export_deployment(
     output: Path, points, proposal, checked, metadata, config, *, plots=True
 ):
     """Only geometry/record/plot work: never run a second policy or baseline."""
-    from stage2.data import instance_fingerprint, instance_to_record
-    from stage2.atsp import WindATSPConfig, WindATSPInstance
     import numpy as np
+
+    from stage2.atsp import WindATSPConfig, WindATSPInstance
+    from stage2.data import instance_fingerprint, instance_to_record
 
     if (output / "summary.json").exists() or (output / "regions.json").exists():
         raise FileExistsError(
@@ -207,6 +221,7 @@ def export_deployment(
                 "equivalent_energy_seconds": row.get("energy_seconds"),
                 "endurance_margin_seconds": row.get("endurance_margin_seconds"),
                 "service_radius_margin_km": row.get("radius_margin_km"),
+                "wind_audit": row.get("wind_audit"),
             }
         )
         metrics.append(
@@ -230,6 +245,7 @@ def export_deployment(
         )
         if plots and row.get("route_ids"):
             import matplotlib.pyplot as plt
+
             from stage2.route_plotting import draw_energy_route
 
             route = tuple(ids.index(t) for t in row["route_ids"])

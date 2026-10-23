@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import json
 import math
-from pathlib import Path
 import queue
 import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 from .candidate import CANDIDATE_BUILTINS, CandidateProposal, validate_candidate_source
 from .domain import DeploymentConfig, Turbine
@@ -129,6 +129,8 @@ if failure is None:
         except tool_runtime.ToolContractError as error: failure=error
     elif not isinstance(answer,dict) or set(answer)!={'nest_ids','assignments'}:
         failure=ValueError('solve must return exactly nest_ids and assignments')
+if failure is None and data.get('joint') and hasattr(tools,'finalize_return'):
+    tools.finalize_return(answer)
 telemetry=dict(tools.stats(),termination=termination)
 if telemetry.get('contract_error_count',0):
     telemetry['termination']='tool_contract_error'
@@ -172,6 +174,8 @@ def _runtime(source_path: Path) -> Path:
             }
             if record.get("search_version") == 5:
                 required |= {"joint_tools.py", "joint_planner.py"}
+                if record.get("tool_contract_version", 4) >= 5:
+                    required |= {"joint_moves.py", "joint_evidence.py"}
             if set(hashes) != required:
                 raise ValueError("Incomplete trusted runtime manifest.")
             return root

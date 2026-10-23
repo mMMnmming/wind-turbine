@@ -1,0 +1,45 @@
+{
+  "C0001.py": {
+    "origin": "original_llm",
+    "source_run": "trial-joint-v5",
+    "sha256": "0e5a2940090119fa639c3ef289114db3096032e930a235b4d96900e38fe19980",
+    "normalized_sha256": "0e5a2940090119fa639c3ef289114db3096032e930a235b4d96900e38fe19980"
+  },
+  "C0002.py": {
+    "origin": "original_llm",
+    "source_run": "trial-joint-v5",
+    "sha256": "6b7ce949de38f9a8818238af9ce2959b2dff7a50744174a340bd85370b2f8ac9",
+    "normalized_sha256": "6b7ce949de38f9a8818238af9ce2959b2dff7a50744174a340bd85370b2f8ac9"
+  },
+  "C0003.py": {
+    "origin": "original_llm",
+    "source_run": "trial-joint-v5",
+    "sha256": "471159ad6c24a0cfdc9f7b77f4858eae6e7e2cce26692ae7677d8eb3d94859cb",
+    "normalized_sha256": "471159ad6c24a0cfdc9f7b77f4858eae6e7e2cce26692ae7677d8eb3d94859cb"
+  },
+  "C0004.py": {
+    "origin": "original_llm",
+    "source_run": "trial-joint-v5",
+    "sha256": "ee32047cfb57daeee12814beedd2135860ba517df2fa5938196ba22bcaa3c34e",
+    "normalized_sha256": "ee32047cfb57daeee12814beedd2135860ba517df2fa5938196ba22bcaa3c34e"
+  },
+  "C0005.py": {
+    "origin": "original_llm",
+    "source_run": "trial-joint-v5",
+    "sha256": "6d0258e75bff55491b1457b6227fbd785208a10cf905bb19ec22507fb69120ac",
+    "normalized_sha256": "6d0258e75bff55491b1457b6227fbd785208a10cf905bb19ec22507fb69120ac"
+  },
+  "C0006.py": {
+    "origin": "original_llm",
+    "source_run": "trial-joint-v5",
+    "sha256": "6c846e60b58cda71588a3cf0feb33913219af50a611fe57676acbf9d0bf32ceb",
+    "normalized_sha256": "6c846e60b58cda71588a3cf0feb33913219af50a611fe57676acbf9d0bf32ceb"
+  },
+  "C0003_manual.py": {
+    "origin": "manual_revision",
+    "derived_from": "original/C0003.py",
+    "sha256": "b018ba5325225f0ba69fd678bfbca3ba2ac39e946c911bc622bc0b4cddbcfe55",
+    "changes": "coverage-preserving structural moves; reduce/relocate/redistribute cycle; repair only initial construction",
+    "normalized_sha256": "b018ba5325225f0ba69fd678bfbca3ba2ac39e946c911bc622bc0b4cddbcfe55"
+  }
+}

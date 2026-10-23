@@ -1,5 +1,7 @@
 # Stage1+LLM v4：可信工具、多目标部署搜索与实时日志
 
+**最新修订见第11节：v5 同巢数含风时间优化与六轮定向验收。第1～9节为旧版本，第10节为v5初版；新运行优先按第11节操作。**
+
 仅运行本目录的独立部署搜索，不调用原Stage1、不修改Stage2、不训练神经网络。框架仍为 **LLM生成完整部署程序 → 独立审核 → Pareto档案 → 按反馈进化**，不是MCTS。CLI默认读取 `config/search-v4.json`。v3结果可查看和选择，但不能直接恢复为v4搜索；旧配置保留，修改实现后也必须新建实验。
 
 ## 1. 安装、密钥与离线测试
@@ -329,3 +331,97 @@ python -u "stage1+llm/run.py" evaluate --search-config "stage1+llm/config/search
 输出 `summary.json`、`regions.json`、`model_metrics.json`、`evaluation.json` 和逐区域网络路线图。所有风机、机巢、坐标及风况冻结在清单里。新导出包记录可信工具快照、模型哈希和依赖，运行需要匹配的Stage2仓库及单独提供的权重，不再宣称无需模型即可独立执行。
 
 新部署改变了分区，必须针对新的 `regions.json` 重新求分支定界参考，不能沿用旧四区域最优值。最优性gap只在相同区域与环境下比较；分支定界不参与LLM搜索反馈。
+
+## 11. v5修订：同巢数时间优化、结构原语与定向六轮
+
+搜索入口仍为 `search_version=5`，可信工具契约升级为5。实现/提示词指纹已变，必须新run ID；不能恢复初版v5搜索。旧结果仍可读取，已导出的旧工具快照保留原语义；尚未导出的旧结果应在原实现下导出，不能拿新版工具冒充原实现。
+
+### 优化与风况验收
+
+每实例先满足覆盖、合法巢位、自归属、半径以及Stage2现有风速/风向下的实际巡检、返航和续航；然后按巢数→总飞行秒→最长区域秒严格比较。同巢数下总飞行时间下降就是有效改善，不要求一律减巢。跨实例仍按平均巢数→平均总飞行秒→全实例最长区域秒比较；平均巢数相同不代表逐实例巢数相同。
+
+提示词约定局部搜索循环为减巢→迁巢→非机巢任务搬移/交换（1:2），人工修正版明确实现该循环。LLM仍生成完整算法，是否遵循约定要结合结构操作计数与实际结果审计，不能仅凭phase名称认定。
+
+新增纯结构工具：
+
+| 调用 | 作用 |
+|---|---|
+| `reassign_tasks(assignments, updates)` | 只重分配非机巢任务，保持巢数，可在一次updates中交换任务 |
+| `remove_nest(assignments, nest_id, updates)` | updates必须覆盖源区域所有成员，包括旧巢自身；目标必须是剩余巢 |
+| `relocate_nest(assignments, old_nest, new_nest)` | 旧巢风机继续作为任务；包括新位置原所属区域在内，返回全部受影响区域 |
+| `merge_nests(assignments, source_nest, target_nest)` | 源巢及其成员全部归属目标巢，保留全部风机键 |
+
+均返回 `{'assignments':完整新映射,'affected_nests':旧/新受影响巢ID列表}`，不修改输入、不调用网络、不判断物理可行、不自动选巢/修复/remember；每次调用计一个动作。通过 `make_proposal(change['assignments'])` 构造完整proposal。候选显式执行半径筛查、受影响区域网络评价及最终完整deployment；无变化区域利用可信缓存。自行实现的邻域仍需tick，工具无法观测未提交的任意Python内部动作。
+
+每区域 `wind_audit` 保存环境指纹、实际闭环各航段及返航秒、悬停等效秒、续航余量。直接复用Stage2有向矩阵与evaluate_route，不另写风速公式。阵风12 m/s仍是现有特征，不代表新增随机阵风鲁棒验证；网络路线不满足续航不等于部署已证明无解。
+
+### 保留原始结果，先做无LLM对照
+
+`baselines/joint-v5/original/` 按原始字节归档六份真实候选，来源及原始/标准化SHA256见 `provenance.json`。`C0003_manual.py` 是明确标记的人工修正版，不是新的LLM搜索成果。评价时按源码哈希识别已知来源，不通过文件名猜测；未知源码标记为unverified_external。
+
+服务器先在原实现下备份/导出旧C0003及完整运行目录，再同步新版（保留私密配置与正式权重）。激活已有CUDA环境，执行第10节check-model。正式权重仅在服务器，本地模拟测试不能替代这一步。
+
+下面对照不调用LLM，只读取正式网络：
+
+```bash
+python -u "stage1+llm/run.py" benchmark --search-config "stage1+llm/config/search-v5.json" --candidate "stage1+llm/baselines/joint-v5/original/C0003.py" --candidate "stage1+llm/baselines/joint-v5/C0003_manual.py" --stage2-checkpoint "stage2/outputs/finetune-edge-v2/control/best_greedy.pt" --stage2-device cuda --run-id baseline-joint-v5-fixedk
+```
+
+每个候选/实例开始前清空区域缓存与计数，保留已加载模型；结果记录数据指纹、预算、算法耗时、真实推理/缓存计数、执行证据和失败。候选失败继续记录其他实例；模型/服务故障停止，不回退模型。完整通过17实例才有聚合目标，不以部分实例成绩冒充完整结果。搜索使用共享缓存加速，与冷缓存基准明确区分；不能直接把旧热缓存的分数搬来做等预算比较。
+
+### 收费六轮：必须另行确认后手动启动
+
+先检查无LLM对照结果，再决定是否执行。新配置 `search-v5-focused.json` 默认导入归档的原始C0003，在当前网络、数据和预算下完整重评。种子重评不计LLM生成轮数，但计入实际计算耗时；种子失败则停止，不请求LLM。
+
+六次生成方向固定为：同巢数、同巢数、减巢、同巢数、同巢数、减巢，每次选当前完整评价的最佳可行父代。失败仍占一轮，不补发请求；配置强制6轮，停滞上限至少6。导入标识S0000，生成候选C0001～C0006；来源明确为已有算法的继续改进。
+
+仅在确认收费运行后，从仓库根目录手动执行：
+
+```bash
+if [ -e "stage1+llm/outputs/trial-joint-v5-fixedk" ] || [ -e "stage1+llm/outputs/.trial-joint-v5-fixedk.lock" ]; then
+  echo "已有结果或锁，请先检查，不重复启动"
+else
+  mkdir -p "stage1+llm/outputs/console"
+  log="stage1+llm/outputs/console/trial-joint-v5-fixedk_$(date +%Y%m%d_%H%M%S).log"
+  nohup python -u "stage1+llm/run.py" optimize --search-config "stage1+llm/config/search-v5-focused.json" --stage2-checkpoint "stage2/outputs/finetune-edge-v2/control/best_greedy.pt" --stage2-device cuda --run-id trial-joint-v5-fixedk --thinking disabled --max-tokens 8192 --api-retries 0 --stream --show-code > "$log" 2>&1 < /dev/null &
+  printf 'PID=%s\n日志=%s\n' "$!" "$log"
+fi
+```
+
+也可显式传 `--search-mode focused_six --seed-candidate 路径 --evaluation-budget 6 --no-improvement-limit 6`。已知人工种子会保留manual_revision来源，未知种子保留unverified_external来源，不能标为原始LLM候选。
+
+同版本正常中断后恢复，不改变原预算/环境；CLI从保存状态恢复定向模式，种子使用运行目录中的归档，不依赖外部原始路径：
+
+```bash
+python -u "stage1+llm/run.py" resume --search-config "stage1+llm/config/search-v5-focused.json" --resume-run-id trial-joint-v5-fixedk --thinking disabled --max-tokens 8192 --api-retries 0 --stream --show-code
+```
+
+保持其他生成参数与首次运行一致。已有源码不重新生成，已完成实例不重跑，未知结果的中断API轮次被消耗而不重放。不要并发写同一run。
+
+### 查看改进证据
+
+保留search_state、summary、trajectory和逐轮evaluation；新增 `seed_evaluation.json`、`instance_metrics.json`，trajectory分别标记是否优于父代、是否刷新全局最好。种子与生成历史分开计数，最佳仍为S0000时说明尚未找到更好子代。
+
+每实例telemetry包含：
+
+- `structural_move_attempts`：各纯结构原语尝试次数，能检查是否只反复做一种动作。
+- `search_evidence.fixed_nest_distinct_attempts`：通过显式原语提交的不同同巢数结构方案；不代表物理可行。
+- `fixed_nest_distinct_deployment_checks`、`distinct_feasible_deployments`：进入完整部署检查/实际可行的不同方案，去重后计数。
+- `first_feasible`、`best_observed`、`last_remembered`、`returned`：首个可行、观察最好、最后显式保存及返回方案的目标和哈希。
+- `strict_improvements`、`fixed_nest_strict_improvements`：累计严格改善，不因修复重置；重复请求或改phase不算。
+- `region_failure_counts` 与 `failure_counts`：区域请求/完整部署检查的失败原因，两个口径分别报告，不相加当独立失败邻域。
+- `post_repair_evaluation_calls`：仍仅为最后一次修复后的窗口；`lifetime_post_repair_evaluation_calls` 是累计值。
+
+候选自行写出的、未提交工具的动作不可观测。观察到更好方案也不代表候选保存或最终返回了它，框架不会据观测偷偷替换结果。
+
+### 本地测试顺序
+
+先运行新增针对性用例，再统一全量回归；均不调用收费API：
+
+```bash
+python -m unittest discover -s "stage1+llm/tests" -p "test_joint_revision.py" -v
+python -m coverage run --rcfile "stage1+llm/.coveragerc" -m unittest discover -s "stage1+llm/tests" -p "test_*.py" -q
+python -m coverage report --rcfile "stage1+llm/.coveragerc"
+```
+
+离线验收覆盖结构完整性、同巢数时间改善、风况/返航/缓存、来源、模拟六轮失败计数及恢复；服务器仍须验收正式权重和真实部署质量。实现通过测试不保证人工或LLM修正版一定更好，不自动扩大40轮，87仍只在最终选定算法后测试。
