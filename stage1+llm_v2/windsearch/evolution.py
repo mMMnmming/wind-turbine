@@ -84,7 +84,8 @@ class Evolution:
         self.elapsed_before = 0.0
         self.client = None
         self.system = (LOCAL / "prompts/system.md").read_text(encoding="utf-8")
-        self.identity = {"version": 2, "interface": "initialize-propose-v2",
+        self.identity = {"version": 2, "evolution_schema": "qualified-cases-v1",
+                         "interface": "initialize-propose-v2",
                          "settings": settings.snapshot(), "dataset": bundle["fingerprint"],
                          "oracle": planner.metadata, "provider": {
                              k: v for k, v in asdict(llm).items() if k != "api_key"},
@@ -98,31 +99,51 @@ class Evolution:
             "active_seconds": self.elapsed_before + time.perf_counter() - self.started})
 
     def archive(self):
+        # Python's stable sort keeps the earlier candidate on exact objective ties.
         return sorted((r for r in self.history if r.get("eligible")),
                       key=lambda r: tuple(r["objectives"]))[:self.settings.archive_size]
 
-    def choose(self, index):
+    def cases(self):
+        return [r for r in self.history if r.get("eligible")]
+
+    def choose(self, index, attempt_number=1):
         archive = self.archive()
-        if not self.history:
+        if attempt_number == 2:
+            # Failed source is repair material, never a qualified parent.
+            previous = self.history[-1]
+            parents = [r for r in archive if r["candidate_id"] in previous["parent_ids"]]
+            return "repair", parents
+        if attempt_number == 3:
             return "initialize", []
-        # Carry the actual failing source and error into the next paid round.
-        if self.history[-1].get("error"):
-            return "repair", [self.history[-1]]
         if not archive:
             return "initialize", []
         op = ["structural_mutation", "elite_refinement", "parameter_refinement", "parent_fusion"][(index-2) % 4]
-        if op == "parent_fusion" and len(archive) < 2:
+        distinct = []
+        for row in archive:
+            if row["source_sha256"] not in {r["source_sha256"] for r in distinct}:
+                distinct.append(row)
+        if op == "parent_fusion" and len(distinct) < 2:
             op = "structural_mutation"
-        parents = archive[:2] if op == "parent_fusion" else archive[:1]
+        parents = distinct[:2] if op == "parent_fusion" else archive[:1]
         return op, parents
 
-    def feedback(self, op, parents):
+    def feedback(self, op, parents, repair_target=None):
         context = {"direction_id": op, "instruction": OPERATORS[op],
                    "initialization": "every candidate-instance starts with one nest per turbine",
                    "work_limits": {k: getattr(self.settings, k) for k in
                                    ("search_seconds", "max_proposals", "max_stage2_inferences", "stagnation_limit")},
                    "parents": [], "recent": [], "best_objectives": (
                        self.archive()[0]["objectives"] if self.archive() else None)}
+        if repair_target:
+            source_path = repair_target.get("source_path")
+            context["repair_target"] = {
+                "attempt_id": repair_target["attempt_id"],
+                "role": "failed source to repair, NOT a qualified parent",
+                "algorithm_code": (self.records.root / source_path).read_text(encoding="utf-8")
+                    if source_path else None,
+                "error": self.error_brief(repair_target.get("error")),
+                "instances": [self.feedback_instance(i) for i in repair_target.get("instances", [])],
+            }
         for parent in parents:
             context["parents"].append({"candidate_id": parent["candidate_id"],
                 "algorithm_code": (self.records.root / parent["source_path"]).read_text(encoding="utf-8")
@@ -132,7 +153,8 @@ class Evolution:
                 "error": self.error_brief(parent.get("error")),
                 "timing": parent.get("timing")})
         for row in self.history[-3:]:
-            context["recent"].append({"candidate_id": row["candidate_id"],
+            context["recent"].append({"candidate_id": row.get("candidate_id"),
+                "attempt_id": row["attempt_id"],
                 "change_hypothesis": row.get("change_hypothesis"), "status": row["status"],
                 "objectives": row.get("objectives"), "improved_parent": row.get("improved_parent"),
                 "error": self.error_brief(row.get("error")),
@@ -161,15 +183,19 @@ class Evolution:
         return {k: error[k] for k in ("error", "error_type", "candidate_frames", "instance") if k in error}
 
     def generate(self, row, context):
-        cid = row["candidate_id"]
+        cid = row["attempt_id"]
         self.records.json("llm_feedback/" + cid + ".json", context)
         self.records.json("diagnostics/requests/" + cid + ".json", {
             "system": self.system, "feedback": context,
             "provider": self.identity["provider"]})
         self.pending = {"phase": "request_started", "row": row}
         self.save()  # Write before dispatch: unknown requests are never replayed.
-        self.records.progress(f"[第{row['index']}/{self.settings.evaluation_budget}代] "
-                              f"{row['operator']}｜父代{','.join(row['parent_ids']) or '无，从零生成'}｜生成代码中")
+        self.records.progress(f"[案例{row['round_index']}/{self.settings.evaluation_budget}·"
+                              f"尝试{row['attempt_number']}/{self.settings.max_attempts_per_round} {cid}] "
+                              f"{row['operator']}｜正式父代:{','.join(row['parent_ids']) or '无'}"
+                              f"｜选择原因:{row['selection_reason']}"
+                              + (f"｜修复对象:{row['repair_target']}" if row['repair_target'] else "")
+                              + "｜生成代码中")
         stop = threading.Event()
         start = time.perf_counter()
 
@@ -183,12 +209,12 @@ class Evolution:
             if self.client is None:
                 self.client = DeepSeekClient(self.llm)
                 self.client.set_observer(lambda message, **fields: self.records.event(
-                    "provider_event", candidate=self.pending["row"]["candidate_id"],
+                    "provider_event", attempt=self.pending["row"]["attempt_id"],
                     message=message, **fields))
             model = self.client.generate(self.system, json.dumps(context, ensure_ascii=False),
                                          expected_direction=row["operator"])
             row.update(asdict(model))
-            row["source_path"] = "candidates/" + cid + ".py"
+            row["source_path"] = "candidates/attempts/" + cid + ".py"
             self.records.text(row["source_path"], model.algorithm_code)
             row.pop("algorithm_code")
             row["source_sha256"] = sha256_file(self.records.root / row["source_path"])
@@ -216,7 +242,7 @@ class Evolution:
             if any(r["name"] == dataset["name"] for r in instances):
                 continue
             result = run_instance(source, str(self.records.root / row["source_path"]), dataset,
-                                  self.settings, self.planner, self.records, row["candidate_id"],
+                                  self.settings, self.planner, self.records, row["attempt_id"],
                                   index, len(self.bundle["datasets"]))
             instances.append(compact_instance(result))
             if result["error"]:
@@ -235,31 +261,73 @@ class Evolution:
 
     def finish(self, row):
         archive = self.archive()
-        parent = next((r for r in self.history if r["candidate_id"] in row["parent_ids"]
-                       and r.get("eligible")), None)
+        parent = next((r for r in archive if r["candidate_id"] in row["parent_ids"]), None)
         key = tuple(row["objectives"]) if row.get("eligible") else None
         row["improved_parent"] = bool(key is not None and parent and key < tuple(parent["objectives"]))
         row["improved_global"] = bool(key is not None and (not archive or key < tuple(archive[0]["objectives"])))
-        self.records.json("diagnostics/evaluations/" + row["candidate_id"] + ".json", row)
+        if row.get("eligible"):
+            row["candidate_id"] = f"C{row['round_index']:04d}"
+            row.setdefault("attempt_source_path", row["source_path"])
+            source = (self.records.root / row["source_path"]).read_text(encoding="utf-8")
+            row["source_path"] = "candidates/" + row["candidate_id"] + ".py"
+            self.records.text(row["source_path"], source)
+        self.records.json("diagnostics/evaluations/" + row["attempt_id"] + ".json", row)
         self.history.append(row)
         self.pending = None
         self.save()
         self.reports("running")
         if row.get("eligible"):
             k, total, maximum = row["objectives"]
-            self.records.progress(f"[本代结束 {row['candidate_id']}] {len(row['instances'])}/{len(self.bundle['datasets'])}实例正常可行"
+            self.records.progress(f"[案例完成 {row['candidate_id']}] 来源{row['attempt_id']}"
+                                  f"｜{len(row['instances'])}/{len(self.bundle['datasets'])}实例正常可行"
                                   f"｜平均{k:.4f}巢 / {total:.1f}s｜最长区域{maximum:.1f}s"
                                   f"｜超过父代:{'是' if row['improved_parent'] else '否/无可行父代'}"
                                   f"｜刷新最好:{'是' if row['improved_global'] else '否'}")
         else:
-            self.records.progress(f"[本代失败 {row['candidate_id']}] "
+            self.records.progress(f"[尝试失败 {row['attempt_id']}] "
                                   + str((row.get('error') or {}).get('error', row['status']))[:200])
+
+    def token_usage(self):
+        fields = ("prompt_tokens", "completion_tokens", "total_tokens")
+        totals, unknown = {}, {}
+        attempts = self.history + ([self.pending["row"]] if self.pending else [])
+        for field in fields:
+            values = [(r["attempt_id"], (r.get("api_metadata") or {}).get("usage") or {})
+                      for r in attempts]
+            known = [usage[field] for _, usage in values if isinstance(usage.get(field), int)]
+            missing = [aid for aid, usage in values if not isinstance(usage.get(field), int)]
+            totals[field] = {"total": sum(known) if not missing else None,
+                             "known_subtotal": sum(known)}
+            unknown[field] = missing
+        return {"tokens": totals, "unknown_attempts": unknown,
+                "note": "Provider-reported token counts; unknown usage is not zero or a price estimate"}
+
+    def candidate_index(self):
+        attempts = {}
+        cases = {}
+        for row in self.history:
+            aid = row["attempt_id"]
+            entry = {"attempt_id": aid, "result_id": aid,
+                     "candidate_id": row.get("candidate_id"), "eligible": row.get("eligible", False),
+                     "status": row["status"], "round_index": row["round_index"],
+                     "source_path": row.get("source_path"),
+                     "evaluation_directory": "diagnostics/evaluations/" + aid,
+                     "problem_directory": "diagnostics/runtime/" + aid}
+            attempts[aid] = entry
+            if row.get("eligible"):
+                cases[row["candidate_id"]] = dict(entry)
+        return {"schema_version": 1, "expected_instances": [d["name"] for d in self.bundle["datasets"]],
+                "cases": cases, "attempts": attempts}
 
     def reports(self, status, error=None):
         archive = self.archive()
         best = archive[0] if archive else None
-        summary = {"version": 2, "status": status, "evaluated_rounds": len(self.history),
+        summary = {"version": 2, "evolution_schema": "qualified-cases-v1", "status": status,
+                   "evaluated_rounds": len(self.cases()), "completed_cases": len(self.cases()),
+                   "attempted_generations": len(self.history) + bool(self.pending),
+                   "pending_attempt": self.pending["row"]["attempt_id"] if self.pending else None,
                    "evaluation_budget": self.settings.evaluation_budget,
+                   "max_attempts_per_round": self.settings.max_attempts_per_round,
                    "fully_evaluated_candidates": sum(r.get("eligible", False) for r in self.history),
                    "best_candidate": best["candidate_id"] if best else None,
                    "best_objectives": best["objectives"] if best else None,
@@ -272,14 +340,17 @@ class Evolution:
                    "total_llm_seconds": sum(r.get("llm_seconds", 0) for r in self.history),
                    "total_search_seconds": sum(r.get("timing", {}).get("search_seconds", 0) for r in self.history),
                    "total_search_inferences": sum(i["oracle_counters"].get("inferences", 0)
-                        for r in self.history for i in r.get("instances", []))}
+                        for r in self.history for i in r.get("instances", [])),
+                   "api_usage": self.token_usage()}
         self.records.json("summary.json", summary)
-        self.records.json("instance_metrics.json", [{"candidate_id": r["candidate_id"],
+        self.records.json("instance_metrics.json", [{"candidate_id": r.get("candidate_id"),
+            "attempt_id": r["attempt_id"], "round_index": r["round_index"],
             "status": r["status"], "instances": r.get("instances", [])} for r in self.history])
-        columns = ["candidate_id", "parent_ids", "operator", "status", "objectives", "llm_seconds",
+        columns = ["candidate_id", "attempt_id", "round_index", "attempt_number", "parent_ids",
+                   "repair_target", "selection_reason", "operator", "status", "objectives", "llm_seconds",
                    "search_seconds", "strategy_seconds", "evaluation_seconds", "total_seconds",
                    "successful_instances", "initial_only_instances", "stage2_inferences",
-                   "improved_parent", "improved_global", "error"]
+                   "improved_parent", "improved_global", "prompt_tokens", "completion_tokens", "total_tokens", "error"]
         buffer = io.StringIO(newline="")
         writer = csv.DictWriter(buffer, fieldnames=columns)
         writer.writeheader()
@@ -292,6 +363,9 @@ class Evolution:
             out["initial_only_instances"] = sum(r["only_initial_solution"] for r in instances)
             out["stage2_inferences"] = sum(r["oracle_counters"].get("inferences", 0) for r in instances)
             out["error"] = (row.get("error") or {}).get("error")
+            usage = (row.get("api_metadata") or {}).get("usage") or {}
+            for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                out[field] = usage.get(field)
             for field in ("parent_ids", "objectives"):
                 out[field] = json.dumps(out[field], ensure_ascii=False)
             writer.writerow(out)
@@ -299,13 +373,16 @@ class Evolution:
         self.records.json("diagnostics/runtime/ranking.json", [{"candidate_id": r["candidate_id"],
                             "objectives": r["objectives"]} for r in archive])
         self.records.json("diagnostics/runtime/best.json", best)
+        self.records.json("diagnostics/runtime/candidate_index.json", self.candidate_index())
 
     def recover_request(self):
         row = self.pending["row"]
-        response = self.records.root / "diagnostics/responses" / (row["candidate_id"] + ".json")
+        response = self.records.root / "diagnostics/responses" / (row["attempt_id"] + ".json")
         if response.exists():
             saved = json.loads(response.read_text(encoding="utf-8"))
             metadata = saved.get("metadata", {})
+            row["api_metadata"] = metadata
+            row["llm_seconds"] = metadata.get("elapsed_seconds", row.get("llm_seconds", 0))
             if saved.get("finish_reason") == "stop" and metadata.get("stream_complete", True):
                 try:
                     model = parse_model_response(saved["content"], row["operator"])
@@ -315,7 +392,7 @@ class Evolution:
                     self.finish(row)
                     return
                 row.update(asdict(model))
-                row["source_path"] = "candidates/" + row["candidate_id"] + ".py"
+                row["source_path"] = "candidates/attempts/" + row["attempt_id"] + ".py"
                 self.records.text(row["source_path"], row.pop("algorithm_code"))
                 row["source_sha256"] = sha256_file(self.records.root / row["source_path"])
                 row["llm_seconds"] = metadata.get("elapsed_seconds", 0)
@@ -348,16 +425,32 @@ class Evolution:
             self.records.json("diagnostics/runtime/identity.json", self.identity)
             self.save()
             self.reports("running")
-            while len(self.history) < self.settings.evaluation_budget:
+            status = "target_completed"
+            while len(self.cases()) < self.settings.evaluation_budget:
                 if self.pending:
                     row = self.pending["row"]
                 else:
-                    index = len(self.history) + 1
-                    op, parents = self.choose(index)
-                    row = {"index": index, "candidate_id": f"C{index:04d}", "operator": op,
+                    index = len(self.cases()) + 1
+                    used = sum(r["round_index"] == index for r in self.history)
+                    if used >= self.settings.max_attempts_per_round:
+                        status = "round_attempts_exhausted"
+                        self.records.progress(f"[轮次停止] 案例{index}的{used}次尝试均失败，不自动继续请求")
+                        break
+                    attempt_number = used + 1
+                    op, parents = self.choose(index, attempt_number)
+                    repair_target = self.history[-1] if attempt_number == 2 else None
+                    reason = ("修复一次，合格父代不变" if repair_target else
+                              "修复失败后从零重启" if attempt_number == 3 else
+                              "前两个不同源码的合格算法融合" if op == "parent_fusion" else
+                              "历史全局最好" if parents else "尚无合格父代，从零生成")
+                    row = {"round_index": index, "candidate_id": None,
+                           "attempt_id": f"A{len(self.history)+1:04d}",
+                           "attempt_number": attempt_number, "operator": op,
+                           "selection_reason": reason,
+                           "repair_target": repair_target["attempt_id"] if repair_target else None,
                            "parent_ids": [r["candidate_id"] for r in parents], "instances": []}
                     try:
-                        self.generate(row, self.feedback(op, parents))
+                        self.generate(row, self.feedback(op, parents, repair_target))
                     except Exception as exc:
                         row.update(status="generation_error", eligible=False,
                                    error={"error": str(exc), "error_type": type(exc).__name__,
@@ -373,10 +466,11 @@ class Evolution:
                                error={"error": str(exc), "error_type": type(exc).__name__,
                                       "traceback": traceback.format_exc()})
                 self.finish(row)
-            status = "budget_exhausted" if self.archive() else "no_successful_algorithm"
             self.reports(status)
             best = self.archive()[0]["candidate_id"] if self.archive() else "无正常完成算法"
-            self.records.progress(f"[运行结束] 完成{len(self.history)}轮｜最好:{best}｜结果:{self.records.root}")
+            self.records.progress(f"[运行结束] 完成{len(self.cases())}/{self.settings.evaluation_budget}个有效案例"
+                                  f"｜生成尝试{len(self.history)}次｜最好:{best}｜结果:{self.records.root}")
+            return status
         except BaseException as exc:
             # Do not overwrite a different run's reports on identity mismatch.
             if identity_verified:

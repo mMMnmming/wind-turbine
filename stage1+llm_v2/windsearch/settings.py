@@ -33,6 +33,7 @@ class SearchSettings:
     gust_speed_mps: float = 12.0
     deployment: DeploymentConfig = field(default_factory=DeploymentConfig)
     evaluation_budget: int = 6
+    max_attempts_per_round: int = 3
     seed: int = 1234
     search_seconds: float = 120.0
     max_proposals: int = 20000
@@ -44,9 +45,11 @@ class SearchSettings:
 
     def __post_init__(self):
         for key in ("evaluation_budget", "max_proposals", "max_stage2_inferences",
-                    "stagnation_limit", "archive_size"):
+                    "stagnation_limit", "archive_size", "max_attempts_per_round"):
             if type(getattr(self, key)) is not int or getattr(self, key) < 1:
                 raise ValueError(key + " must be a positive integer")
+        if self.max_attempts_per_round > 3:
+            raise ValueError("max_attempts_per_round must be 1..3 (initial, repair, restart)")
         for key in ("training_virtual_fields", "validation_virtual_fields", "seed",
                     "data_seed", "validation_seed"):
             if type(getattr(self, key)) is not int or getattr(self, key) < 0:
@@ -82,6 +85,6 @@ def load_deepseek_settings(path):
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     if set(raw) - set(DeepSeekSettings.__dataclass_fields__):
         raise ValueError("Unknown DeepSeek settings")
-    # A round is one HTTP attempt. No hidden retries or replacement requests.
+    # Attempts are explicit in the controller; never hide requests in SDK retries.
     raw["retries"] = 0
     return DeepSeekSettings(**raw)

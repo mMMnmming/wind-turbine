@@ -1,4 +1,5 @@
 openai>=1.40,<3
 numpy>=1.26
 scipy>=1.11
+matplotlib>=3.8
 # Use the existing Stage2 PyTorch/CUDA environment; do not replace its torch build.

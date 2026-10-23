@@ -27,7 +27,9 @@ def parser():
         sub.add_argument("--run-id", type=validate_run_id)
         if command in ("optimize", "resume"):
             sub.add_argument("--deepseek-config", type=Path, default=LOCAL / "config/deepseek.local.json")
-            sub.add_argument("--evaluation-budget", type=int)
+            sub.add_argument("--evaluation-budget", type=int, help="Target number of fully qualified algorithm cases")
+            sub.add_argument("--max-attempts-per-round", type=int, choices=(1, 2, 3),
+                             help="Requests per case including initial generation (default 3)")
             sub.add_argument("--thinking", choices=("enabled", "disabled"))
             sub.add_argument("--max-tokens", type=int)
             sub.add_argument("--stream", action=argparse.BooleanOptionalAction, default=None)
@@ -80,6 +82,8 @@ def main(argv=None):
             overrides["stage2_device"] = args.stage2_device
         if getattr(args, "evaluation_budget", None) is not None:
             overrides["evaluation_budget"] = args.evaluation_budget
+        if getattr(args, "max_attempts_per_round", None) is not None:
+            overrides["max_attempts_per_round"] = args.max_attempts_per_round
         settings = replace(settings, **overrides)
         if args.command == "prepare-data":
             from .data import prepare_data
@@ -153,10 +157,11 @@ def main(argv=None):
             from .data import prepare_data
             from .evolution import Evolution
             bundle = prepare_data(settings)
-            records.progress(f"[运行] {settings.evaluation_budget}代｜{len(bundle['datasets'])}实例/代"
+            records.progress(f"[运行] 目标{settings.evaluation_budget}个有效案例｜每轮最多{settings.max_attempts_per_round}次尝试"
+                             f"｜{len(bundle['datasets'])}实例/案例"
                              f"｜每实例搜索上限{settings.search_seconds:g}s｜每代从单风机单巢起步")
-            Evolution(settings, llm, bundle, planner, records).run(resume=args.command == "resume")
-            return 0
+            status = Evolution(settings, llm, bundle, planner, records).run(resume=args.command == "resume")
+            return 0 if status == "target_completed" else 2
     except KeyboardInterrupt:
         if records:
             records.progress("[中断] 已保存进度；使用相同参数resume，不自动重发未知API请求")

@@ -63,8 +63,10 @@ outputs/<run-id>/
   summary.json                    # 人看/交给助手：整体状态与最好结果
   trajectory.csv                  # 人看/交给助手：逐代成绩和耗时
   instance_metrics.json           # 人看/交给助手：紧凑逐实例指标
-  candidates/C0001.py              # 每代完整源码
-  llm_feedback/C0001.json          # LLM看：实际发送的结构化反馈
+  candidates/C0001.py              # 合格算法案例完整源码
+  candidates/attempts/A0001.py     # 所有生成尝试源码，失败也保留
+  llm_feedback/A0001.json          # LLM看：实际发送的结构化反馈
+  plots/C0001/                     # 手动绘图输出 PNG/PDF/汇总
   diagnostics/
     events.jsonl                  # 助手按需看：完整事件流
     requests/                     # 实际提示词、反馈、生成配置
@@ -89,7 +91,21 @@ outputs/<run-id>/
 
 初始默认每实例搜索120秒、20000次提交、5000次Stage2推理、1000次连续无改善，先达到者停止。初解验证和最终独立审核在搜索预算之外，单独计时。改进是对已接受部署的严格改善，不允许劣解成为当前解。
 
-外层默认6次请求，SDK重试固定为0，失败消耗本轮，没有额外修复请求。没有父代时从零生成；出现错误，下一轮携带出错源码和具体错误修复；已有正常候选时进行结构变异、精英改进、参数改进，有两个可用父代后可融合。保留多个成绩较好的父代，不保证每个子代更优。
+外层默认目标是6个完整通过全部17实例的有效案例，**不是6次API请求**。`--evaluation-budget` 表示有效案例目标；`--max-attempts-per-round` 默认为3，包含首次生成。SDK重试固定为0，额外请求均由控制器显式记录。
+
+| 轮内尝试 | 生成方式 |
+|---|---|
+| 第一次 | 尚无合格算法则从零生成，否则以历史全局最好为父代改进 |
+| 第二次 | 修复本轮第一次失败的源码，正式父代仍为合格算法 |
+| 第三次 | 修复仍失败后从零生成，只保留精简失败经验 |
+
+任一次完整通过所有实例，就完成一个案例。三次全部失败，本次运行以 `round_attempts_exhausted` 停止（退出码2），保留已有案例，不自动发第四次。完成目标时状态为 `target_completed`（退出码0）。允许将尝试上限降到1或2，不能超过3。不能保证三次内必然产生合格算法。
+
+普通进化只选合格档案中的全局最好代码；父代融合选择最好的两个**不同源码**，不足两个则改为单父代结构变异。排序仍只比较部署目标，不按运行时间排序；完全同分时保留更早的候选。子代合格但更差也完成一个案例，不会顶替历史最好。失败源码是 `repair_target`，不是正式父代。
+
+`C0001`等只标识合格案例，`A0001`等标识全部实际生成尝试。`trajectory.csv` 每行是一条尝试，包含案例编号（失败为空）、尝试编号、轮次、轮内次数、父代、修复对象和选择原因。成功案例保存到 `candidates/Cxxxx.py`，原始尝试仍保留在 `candidates/attempts/Axxxx.py`。
+
+`summary.json` 区分已完成案例数和生成尝试数，记录成功及失败尝试的token用量。缺失用量以未知表示，保留已知小计，不按零计费或估算价格。`diagnostics/runtime/candidate_index.json` 将成功案例映射到实际尝试结果目录；完整输入和逐实例评价仍以尝试ID保存，绘图自动解析索引。
 
 ## 服务器运行
 
@@ -109,16 +125,17 @@ python -u "stage1+llm_v2/run.py" check-model \
 
 私密配置可继续通过参数读取旧目录的现有文件，无需复制，也不会修改它。v2在内存中固定使用 `retries=0`，不修改私密配置；也可根据 `config/deepseek.example.json` 创建被本目录 `.gitignore` 排除的 `config/deepseek.local.json`。不要将密钥写进命令行或提交Git。
 
-模型验收通过后，由操作者启动6轮：
+模型验收通过后，由操作者启动目标6个有效案例的新运行：
 
 ```bash
-run_id="v2-$(date +%Y%m%d_%H%M%S)"
+run_id="v2-bestparent-$(date +%Y%m%d_%H%M%S)"
 mkdir -p "stage1+llm_v2/outputs/console"
 nohup python -u "stage1+llm_v2/run.py" optimize \
   --run-id "$run_id" \
   --deepseek-config "stage1+llm/config/deepseek.local.json" \
   --stage2-device cuda \
-  --evaluation-budget 6 --thinking disabled --max-tokens 8192 --stream \
+  --evaluation-budget 6 --max-attempts-per-round 3 \
+  --thinking disabled --max-tokens 8192 --stream \
   > "stage1+llm_v2/outputs/console/${run_id}.log" 2>&1 < /dev/null &
 echo "$run_id"
 ```
@@ -136,10 +153,11 @@ python -u "stage1+llm_v2/run.py" resume \
   --run-id "$run_id" \
   --deepseek-config "stage1+llm/config/deepseek.local.json" \
   --stage2-device cuda \
-  --evaluation-budget 6 --thinking disabled --max-tokens 8192 --stream
+  --evaluation-budget 6 --max-attempts-per-round 3 \
+  --thinking disabled --max-tokens 8192 --stream
 ```
 
-已保存源码不重新付费生成，已完成实例不重复运行。中断的内层实例从单巢初解重新执行。请求结果未知且没有完整响应时，该轮标记未知并消耗预算，不重发同一请求；恢复后仍可继续剩余轮数。代码、提示词、配置、模型或数据指纹变化则拒绝原运行恢复，需新run ID。
+已保存源码不重新付费生成，已完成实例不重复运行。中断的内层实例从单巢初解重新执行。请求结果未知且没有完整响应时，该尝试标记未知并占用本轮一次机会，不重发同一请求；恢复仍遵守原轮次的三次上限。三次耗尽后重复resume不会继续请求。代码、提示词、配置、模型或数据指纹变化则拒绝原运行恢复，需新run ID。此次父代和编号规则变更必须新建搜索run ID，旧结果保持原样，绘图仍兼容旧结果。
 
 选择最好候选后可无LLM单独运行：
 
@@ -150,6 +168,40 @@ python -u "stage1+llm_v2/run.py" evaluate \
 ```
 
 87仅用于算法冻结后的最终测试，必须显式传 `--final-test`；不能将其成绩用于后续进化。
+
+## 在服务器绘制部署和实际路线
+
+绘图只读保存的坐标、完整归属及最终独立审核路线，不运行生成代码，不加载Stage2，不请求LLM，不需要CUDA或桌面。使用Matplotlib的Agg后端，默认英文图例。
+
+绘制最好合格算法的真实102实例：
+
+```bash
+python "stage1+llm_v2/plot_deployment.py" \
+  --run-dir "stage1+llm_v2/outputs/<运行ID>" \
+  --candidate best --instance real102
+```
+
+指定合格案例，批量绘制各实例：
+
+```bash
+python "stage1+llm_v2/plot_deployment.py" \
+  --run-dir "stage1+llm_v2/outputs/<运行ID>" \
+  --candidate C0002 --all-instances
+```
+
+无LLM单独evaluate的结果：
+
+```bash
+python "stage1+llm_v2/plot_deployment.py" \
+  --run-dir "stage1+llm_v2/outputs/<验证运行ID>" \
+  --candidate external --instance turbine102 --show-radius
+```
+
+失败尝试可以显式选择 `--candidate A0003`。当前旧版v2结果仍可直接选择原有C编号；脚本兼容旧v2、新案例索引和external结果。`best`没有合格候选时明确报错，不会退而选择失败尝试。
+
+默认 `--candidate best --instance real102`；`--instance` 与 `--all-instances` 互斥。可用 `--output-dir` 修改输出目录。图中风机按区域着色、机巢用星形标记、箭头表示保存的闭环路线；风箭头遵循Stage2的0北90东方向约定，不额外解释成气象风的来向。标注巢数、总航时、最长区域时间、最小续航余量、候选状态与停止原因。默认不画半径圆，`--show-radius`开启；超过12巢不逐一标注ID。
+
+每实例输出 `outputs/<运行ID>/plots/<候选ID>/<实例>.png` 和同名PDF；同目录 `plot_summary.json` 记录来源文件、指标、实际路线及完成/缺失/错误数量。批量模式保留已完成图，对缺失实例和格式错误逐项报告；有缺失或错误时退出码1，全成功为0。必要数据缺失不会补造坐标、归属或路线。绘图默认手动执行，不拖慢搜索。
 
 ## 本次交付范围
 
