@@ -1,0 +1,6 @@
+outputs/
+__pycache__/
+*.py[cod]
+config/*.local.json
+config/*.private.json
+.env

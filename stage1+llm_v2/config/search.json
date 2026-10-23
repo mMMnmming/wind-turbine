@@ -1,0 +1,31 @@
+{
+  "target_input": "turbine102.tsv",
+  "protected_input": "turbine87.tsv",
+  "data_dir": "stage1+llm_v2/outputs/prepared",
+  "training_virtual_fields": 8,
+  "validation_virtual_fields": 8,
+  "data_seed": 1234,
+  "validation_seed": 1001234,
+  "stage2_checkpoint": "stage2/outputs/finetune-edge-v2/control/best_greedy.pt",
+  "stage2_device": "cuda",
+  "gust_speed_mps": 12.0,
+  "deployment": {
+    "communication_radius_km": 7.0,
+    "max_horizontal_speed_mps": 23.0,
+    "wind_speed_mps": 6.0,
+    "wind_direction_degrees": 90.0,
+    "max_endurance_seconds": 2460.0,
+    "hover_seconds_per_turbine": 10.0,
+    "hover_to_flight_energy_ratio": 1.14,
+    "coordinate_unit": "km"
+  },
+  "evaluation_budget": 6,
+  "seed": 1234,
+  "search_seconds": 120.0,
+  "max_proposals": 20000,
+  "max_stage2_inferences": 5000,
+  "stagnation_limit": 1000,
+  "heartbeat_seconds": 15.0,
+  "stage2_timeout_seconds": 300.0,
+  "archive_size": 6
+}
